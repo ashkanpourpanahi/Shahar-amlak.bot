@@ -3,23 +3,32 @@ import json
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from html import escape
+from io import BytesIO
 from pathlib import Path
+from textwrap import wrap
 from zoneinfo import ZoneInfo
 
 import aiosqlite
+import arabic_reshaper
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+from aiogram.types import (BotCommand, BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
                            KeyboardButton, Message, ReplyKeyboardMarkup)
 from aiogram.fsm.strategy import FSMStrategy
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from bidi.algorithm import get_display
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
+from reportlab.lib.colors import HexColor
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfgen.canvas import Canvas
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -48,6 +57,11 @@ LEAD = "🔎 خریدارم"
 MINE = "📋 ثبت‌های من"
 REVIEW = "✅ بررسی آگهی‌ها"
 INBOX = "📥 درخواست مشتریان"
+OFFICE_VISIT = "📝 ثبت مراجعه"
+DAILY_REPORT = "📄 گزارش مشتریان امروز"
+VISIT_TYPES = ("خریدار", "فروشنده")
+VISIT_SOURCES = ("حضوری", "تلفنی")
+VISIT_STATUSES = ("در انتظار پیگیری", "پیگیری شد")
 MENU = "↩️ منوی اصلی"
 ANY = "همه موارد"
 DEALS = ("فروش", "رهن و اجاره", "پیش‌فروش")
@@ -67,7 +81,7 @@ def keyboard(*rows):
 def main_menu(user_id):
     rows = [(LEAD, ADD), (MINE,)]
     if is_admin(user_id):
-        rows.append((REVIEW, INBOX))
+        rows.extend([(REVIEW, INBOX), (OFFICE_VISIT, DAILY_REPORT)])
     return keyboard(*rows)
 
 
@@ -86,6 +100,14 @@ class BuyerRequest(StatesGroup):
 
 class OwnerReply(StatesGroup):
     text = State()
+
+
+class OfficeVisit(StatesGroup):
+    kind = State()
+    source = State()
+    details = State()
+    phone = State()
+    status = State()
 
 
 scheduler = AsyncIOScheduler(timezone=TZ)
@@ -141,6 +163,17 @@ async def init_db():
             await db.execute("ALTER TABLE leads ADD COLUMN phone TEXT")
         if "replied_at" not in columns:
             await db.execute("ALTER TABLE leads ADD COLUMN replied_at TEXT")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS office_visits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            source TEXT NOT NULL,
+            details TEXT NOT NULL,
+            phone TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """)
         await db.commit()
 
 
@@ -273,6 +306,29 @@ async def menu_action(message: Message, state: FSMContext):
         await admin_leads(message)
 
 
+@dp.message(F.text == OFFICE_VISIT)
+async def start_office_visit(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    await state.set_state(OfficeVisit.kind)
+    await message.answer("مراجعه مربوط به خریدار است یا فروشنده؟", reply_markup=keyboard(VISIT_TYPES, (MENU,)))
+
+
+@dp.message(F.text == DAILY_REPORT)
+async def send_daily_report(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    today = datetime.now(TZ).date()
+    records = await daily_records(today)
+    pdf = await asyncio.to_thread(build_daily_report, today, records)
+    await message.answer_document(
+        BufferedInputFile(pdf, filename=f"shahr-amlak-{today.isoformat()}.pdf"),
+        caption="گزارش مشتریان امروز به وقت تهران",
+        protect_content=True,
+    )
+
+
 @dp.message(Command("help"))
 async def help_command(message: Message):
     await message.answer(
@@ -285,6 +341,7 @@ async def help_command(message: Message):
         "فرمان‌های مدیر:\n"
         "/pending - آگهی‌های پیش‌نویس\n"
         "از «بررسی آگهی‌ها» و «درخواست مشتریان» می‌توانید به ثبت‌کننده پاسخ دهید.\n"
+        "ثبت حضوری و تلفنی و دریافت PDF امروز از منوی مدیریت انجام می‌شود.\n"
         "/cancel - لغو فرم فعلی"
     )
 
@@ -293,6 +350,199 @@ async def help_command(message: Message):
 async def cancel(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("فرم لغو شد.", reply_markup=main_menu(message.from_user.id))
+
+
+@dp.message(OfficeVisit.kind, F.text, ~F.text.startswith("/"))
+async def office_visit_kind(message: Message, state: FSMContext):
+    if message.text not in VISIT_TYPES:
+        await message.answer("«خریدار» یا «فروشنده» را انتخاب کنید.")
+        return
+    await state.update_data(kind=message.text)
+    await state.set_state(OfficeVisit.source)
+    await message.answer("روش مراجعه را انتخاب کنید.", reply_markup=keyboard(VISIT_SOURCES, (MENU,)))
+
+
+@dp.message(OfficeVisit.source, F.text, ~F.text.startswith("/"))
+async def office_visit_source(message: Message, state: FSMContext):
+    if message.text not in VISIT_SOURCES:
+        await message.answer("«حضوری» یا «تلفنی» را انتخاب کنید.")
+        return
+    await state.update_data(source=message.text)
+    await state.set_state(OfficeVisit.details)
+    await message.answer(
+        "مشخصات ملک یا نیاز مشتری را در یک پیام بنویسید. نام مشتری، محله، متراژ و قیمت یا بودجه را در صورت دسترسی اضافه کنید.",
+        reply_markup=keyboard((MENU,)),
+    )
+
+
+@dp.message(OfficeVisit.details, F.text, ~F.text.startswith("/"))
+async def office_visit_details(message: Message, state: FSMContext):
+    details = message.text.strip()
+    if not 0 < len(details) <= 1400:
+        await message.answer("مشخصات را در یک پیام حداکثر ۱۴۰۰ نویسه بفرستید.")
+        return
+    await state.update_data(details=details)
+    await state.set_state(OfficeVisit.phone)
+    await message.answer("شماره موبایل مشتری را با 09 یا +98 وارد کنید.")
+
+
+@dp.message(OfficeVisit.phone, F.text, ~F.text.startswith("/"))
+async def office_visit_phone(message: Message, state: FSMContext):
+    phone = mobile_number(message.text)
+    if not phone:
+        await message.answer("شماره موبایل را با 09 یا +98 وارد کنید.")
+        return
+    await state.update_data(phone=phone)
+    await state.set_state(OfficeVisit.status)
+    await message.answer("وضعیت پیگیری را انتخاب کنید.", reply_markup=keyboard(VISIT_STATUSES, (MENU,)))
+
+
+@dp.message(OfficeVisit.status, F.text, ~F.text.startswith("/"))
+async def save_office_visit(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    if message.text not in VISIT_STATUSES:
+        await message.answer("یکی از وضعیت‌های پیگیری را انتخاب کنید.")
+        return
+    visit = await state.get_data()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "INSERT INTO office_visits (kind, source, details, phone, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (visit["kind"], visit["source"], visit["details"], visit["phone"], message.text,
+             datetime.now(TZ).isoformat(timespec="minutes")),
+        )
+        visit_id = cursor.lastrowid
+        await db.commit()
+    await state.clear()
+    await message.answer(
+        f"مراجعهٔ شماره {visit_id} ثبت شد و در گزارش امروز می‌آید.",
+        reply_markup=main_menu(message.from_user.id),
+    )
+
+
+async def daily_records(today):
+    bounds = (today.isoformat(), (today + timedelta(days=1)).isoformat())
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute("BEGIN")
+        async with db.execute("""
+            SELECT 'خریدار' AS kind, 'تلگرام' AS source, id, created_at, phone,
+                   request_text AS details, replied_at IS NULL AS pending,
+                   CASE WHEN replied_at IS NULL THEN 'در انتظار بررسی' ELSE 'پاسخ ارسال شد' END AS status
+            FROM leads WHERE created_at >= ? AND created_at < ?
+            UNION ALL
+            SELECT kind, source, id, created_at, phone, details, status = 'در انتظار پیگیری', status
+            FROM office_visits WHERE created_at >= ? AND created_at < ?
+        """, bounds * 2) as cursor:
+            records = [dict(row) async for row in cursor]
+        async with db.execute(
+            "SELECT * FROM properties WHERE created_at >= ? AND created_at < ?", bounds
+        ) as cursor:
+            async for row in cursor:
+                rent = "مبلغ رهن" if row["deal_type"] == "رهن و اجاره" else "قیمت"
+                size = f"{row['size_m2']:,} متر" if row["size_m2"] else "ثبت نشده"
+                details = (
+                    f"{row['deal_type']} {row['property_type']}، {row['area']}، متراژ {size}، "
+                    f"{rent}: {format_price(row['price_toman'])}\n{row['details'] or ''}"
+                )
+                records.append(dict(
+                    kind="فروشنده", source="تلگرام", id=row["id"], created_at=row["created_at"],
+                    phone=row["phone"], details=details, pending=row["status"] in ("draft", "scheduled"),
+                    status=STATUS.get(row["status"], row["status"]),
+                ))
+    return sorted(records, key=lambda row: (row["created_at"], row["id"], row["source"]))
+
+
+def pdf_rtl(text):
+    text = "".join(char for char in text if char.isprintable() or char in "\u200c\u200d\u200e")
+    return get_display(arabic_reshaper.reshape(text), base_dir="R")
+
+
+def build_daily_report(today, records):
+    font_dir = Path("/usr/share/fonts/truetype/dejavu")
+    for name, filename in (("Report", "DejaVuSans.ttf"), ("ReportBold", "DejaVuSans-Bold.ttf")):
+        if name not in pdfmetrics.getRegisteredFontNames():
+            pdfmetrics.registerFont(TTFont(name, str(font_dir / filename)))
+
+    buffer = BytesIO()
+    pdf = Canvas(buffer, pagesize=A4)
+    pdf.setTitle(f"Shahr Amlak - {today.isoformat()}")
+    width, height = A4
+    right, left = width - 42, 42
+    buyers = [row for row in records if row["kind"] == "خریدار"]
+    sellers = [row for row in records if row["kind"] == "فروشنده"]
+    pending_count = sum(row["pending"] for row in records)
+    page = 0
+
+    def draw(text, y, *, size=11, bold=False, color="#183334"):
+        pdf.setFont("ReportBold" if bold else "Report", size)
+        pdf.setFillColor(HexColor(color))
+        pdf.drawRightString(right, y, pdf_rtl(text))
+
+    def new_page():
+        nonlocal page
+        if page:
+            pdf.showPage()
+        page += 1
+        draw("شهر املاک پناهی", height - 43, bold=True, color="#08786D")
+        draw("گزارش روزانهٔ مشتریان", height - 75, size=20, bold=True)
+        draw(f"تاریخ گزارش: \u200e{today.isoformat()}\u200e   |   به وقت تهران", height - 98)
+        pdf.setStrokeColor(HexColor("#B7D7D2"))
+        pdf.line(left, height - 113, right, height - 113)
+        draw(f"خریداران: {len(buyers)}   |   فروشندگان: {len(sellers)}   |   منتظر پیگیری: {pending_count}",
+             height - 136, bold=True)
+        draw(f"گزارش داخلی دفتر   |   صفحه {page}", 34, size=9, color="#536C6D")
+        return height - 174
+
+    y = new_page()
+    for title, rows in (("خریداران", buyers), ("فروشندگان", sellers)):
+        if y < 185:
+            y = new_page()
+        draw(f"{title}  ({len(rows)})", y, size=15, bold=True, color="#08786D")
+        y -= 24
+        if not rows:
+            draw("امروز موردی ثبت نشده است.", y, color="#536C6D")
+            y -= 32
+        for row in rows:
+            # Break long unspaced input before measuring the displayed text.
+            lines = []
+            for paragraph in row["details"].splitlines():
+                line = ""
+                for word in (part for token in paragraph.split() for part in wrap(token, 30)):
+                    candidate = f"{line} {word}".strip()
+                    if pdfmetrics.stringWidth(pdf_rtl(candidate), "Report", 11) > right - left:
+                        lines.append(line)
+                        line = word
+                    else:
+                        line = candidate
+                if line:
+                    lines.append(line)
+
+            if y - min(len(lines), 3) * 17 < 108:
+                y = new_page()
+                draw(f"{title} (ادامه)", y, size=15, bold=True, color="#08786D")
+                y -= 24
+            clock = row["created_at"][11:16]
+            draw(f"{clock}   |   {row['source']}   |   ثبت {row['id']}   |   {row['status']}", y, bold=True)
+            phone = row["phone"] or "ثبت نشده"
+            if phone.startswith("+"):
+                # Force the plus sign to stay on the left of international numbers.
+                phone = "\u200e" + phone
+            draw(f"شماره تماس: {phone}", y - 19)
+            y -= 37
+            for line in lines:
+                if y < 60:
+                    y = new_page()
+                    draw(f"{title}   |   ادامهٔ ثبت {row['id']}", y, bold=True, color="#08786D")
+                    y -= 22
+                draw(line, y)
+                y -= 17
+            pdf.setStrokeColor(HexColor("#DFEAE8"))
+            pdf.line(left, y + 3, right, y + 3)
+            y -= 19
+        y -= 8
+    pdf.save()
+    return buffer.getvalue()
 
 
 @dp.message(Command("add"))
