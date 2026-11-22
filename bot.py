@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -24,11 +25,13 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
 ADMIN_IDS = {
     int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",")
     if x.strip().isdigit()
 }
+OWNER_ID = os.getenv("OWNER_ID", "").strip() or (
+    str(next(iter(ADMIN_IDS))) if len(ADMIN_IDS) == 1 else ""
+)
 DB_PATH = os.getenv("DB_PATH", "amlak.db")
 AI_API_KEY = os.getenv("AI_API_KEY", "").strip()
 AI_BASE_URL = os.getenv("AI_BASE_URL", "").strip() or None
@@ -40,8 +43,8 @@ dp.message.filter(F.chat.type == "private")
 publication_lock = asyncio.Lock()
 
 FIND = "🔎 پیدا کردن ملک"
-ADD = "🏠 ثبت ملک"
-LEAD = "📩 درخواست مشاور"
+ADD = "🏠 فروشنده‌ام"
+LEAD = "🔎 خریدارم"
 MINE = "📋 ثبت‌های من"
 REVIEW = "✅ بررسی آگهی‌ها"
 INBOX = "📥 درخواست مشتریان"
@@ -50,7 +53,8 @@ ANY = "همه موارد"
 DEALS = ("فروش", "رهن و اجاره", "پیش‌فروش")
 TYPES = ("آپارتمان", "زمین", "مغازه", "ویلا", "اداری", "سایر")
 STATUS = {"draft": "در انتظار بررسی", "scheduled": "زمان‌بندی‌شده",
-          "published": "منتشرشده", "rejected": "ردشده", "closed": "بسته‌شده"}
+          "published": "تأییدشده", "reviewed": "پاسخ دفتر ارسال شد",
+          "rejected": "ردشده", "closed": "بسته‌شده"}
 
 
 def keyboard(*rows):
@@ -61,7 +65,7 @@ def keyboard(*rows):
 
 
 def main_menu(user_id):
-    rows = [(FIND, ADD), (LEAD, MINE)]
+    rows = [(LEAD, ADD), (MINE,)]
     if is_admin(user_id):
         rows.append((REVIEW, INBOX))
     return keyboard(*rows)
@@ -77,6 +81,13 @@ class SearchProperty(StatesGroup):
 class BuyerRequest(StatesGroup):
     description = State()
     viewing = State()
+    phone = State()
+
+
+class OwnerReply(StatesGroup):
+    text = State()
+
+
 scheduler = AsyncIOScheduler(timezone=TZ)
 
 
@@ -91,7 +102,7 @@ class AddProperty(StatesGroup):
 
 
 def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+    return str(user_id) == OWNER_ID
 
 
 async def init_db():
@@ -119,9 +130,17 @@ async def init_db():
             user_id INTEGER NOT NULL,
             username TEXT,
             request_text TEXT NOT NULL,
+            phone TEXT,
+            replied_at TEXT,
             created_at TEXT NOT NULL
         )
         """)
+        async with db.execute("PRAGMA table_info(leads)") as cursor:
+            columns = {row[1] for row in await cursor.fetchall()}
+        if "phone" not in columns:
+            await db.execute("ALTER TABLE leads ADD COLUMN phone TEXT")
+        if "replied_at" not in columns:
+            await db.execute("ALTER TABLE leads ADD COLUMN replied_at TEXT")
         await db.commit()
 
 
@@ -137,6 +156,26 @@ def format_price(price):
     if not price:
         return "توافقی / ثبت نشده"
     return f"{price:,} تومان"
+
+
+def mobile_number(text):
+    digits = text.strip().translate(
+        str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+    )
+    return digits if re.fullmatch(r"(?:0|\+98)9[0-9]{9}", digits) else None
+
+
+def reply_button(kind, record_id):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✉️ ارسال پاسخ", callback_data=f"ownerreply:{kind}:{record_id}")
+    ]])
+
+
+async def notify_owner(bot, text, markup):
+    try:
+        await bot.send_message(int(OWNER_ID), text, reply_markup=markup)
+    except TelegramAPIError:
+        logging.warning("Could not notify the owner; submission is available in the bot inbox")
 
 
 def property_text(row, *, admin=False):
@@ -167,12 +206,6 @@ async def publish_property(bot: Bot, property_id: int, *, due_at=None):
             return False
         if due_at and (row["status"] != "scheduled" or row["scheduled_at"] > due_at):
             return False
-        if CHANNEL_ID:
-            try:
-                await bot.send_message(CHANNEL_ID, property_text(row), parse_mode="HTML")
-            except Exception:
-                logging.exception("Could not publish property %s to channel", property_id)
-                return False
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
                 "UPDATE properties SET status='published', scheduled_at=NULL WHERE id=?",
@@ -210,20 +243,21 @@ async def user_id(message: Message):
     await message.answer(f"شناسه تلگرام شما: {message.from_user.id}")
 
 
-@dp.message(F.text == FIND)
+@dp.message(F.text == FIND, lambda message: is_admin(message.from_user.id))
 async def start_find(message: Message, state: FSMContext):
     await state.clear()
     await state.set_state(SearchProperty.deal)
     await message.answer("نوع معامله را انتخاب کنید.", reply_markup=keyboard(DEALS, (ANY, MENU)))
 
 
-@dp.message(F.text == LEAD)
+@dp.message(F.text.in_({LEAD, "📩 درخواست مشاور"}))
 async def start_lead(message: Message, state: FSMContext):
     await state.clear()
     await state.set_state(BuyerRequest.description)
     await message.answer(
-        "محله، نوع ملک، متراژ و بودجه را بنویسید. برای تماس تلفنی می‌توانید شماره‌تان را هم وارد کنید. "
-        "با ارسال پیام، اطلاعات را برای پیگیری در اختیار دفتر می‌گذارید.",
+        "نوع معامله، شهر و محله، نوع ملک، متراژ و بودجه را در یک پیام بنویسید. "
+        "مثلاً خرید آپارتمان ۱۲۰ متری در صدرا فاز ۲ تا ۸ میلیارد تومان. "
+        "شماره تماس را در مرحلهٔ بعد می‌گیریم.",
         reply_markup=keyboard((MENU,)),
     )
 
@@ -244,15 +278,13 @@ async def help_command(message: Message):
     await message.answer(
         "فرمان‌ها:\n"
         "/add - ثبت آگهی\n"
-        "/search عبارت - جست‌وجوی فایل‌ها\n"
         "/lead متن درخواست - ثبت درخواست مشتری\n"
         "/myads - آگهی‌های ثبت‌شده توسط شما\n"
         "/close شماره - بستن آگهی خودتان در ربات\n"
         "/leads - درخواست‌های مشتری (مدیر)\n"
         "فرمان‌های مدیر:\n"
         "/pending - آگهی‌های پیش‌نویس\n"
-        "/publish شناسه - انتشار فوری در کانال\n"
-        "/schedule شناسه YYYY-MM-DD HH:MM - زمان‌بندی انتشار\n"
+        "از «بررسی آگهی‌ها» و «درخواست مشتریان» می‌توانید به ثبت‌کننده پاسخ دهید.\n"
         "/cancel - لغو فرم فعلی"
     )
 
@@ -264,7 +296,7 @@ async def cancel(message: Message, state: FSMContext):
 
 
 @dp.message(Command("add"))
-@dp.message(F.text == ADD)
+@dp.message(F.text.in_({ADD, "🏠 ثبت ملک"}))
 async def add_start(message: Message, state: FSMContext):
     await state.clear()
     await state.set_state(AddProperty.deal_type)
@@ -334,19 +366,15 @@ async def add_details(message: Message, state: FSMContext):
         return
     await state.update_data(details=message.text.strip()[:1500])
     await state.set_state(AddProperty.phone)
-    await message.answer("شماره موبایل را بفرستید. دفتر شماره را برای پیگیری ثبت می‌کند. می‌توانید «بدون شماره» را انتخاب کنید.", reply_markup=keyboard(("بدون شماره", MENU)))
+    await message.answer("شماره موبایل را با 09 یا +98 بفرستید. شماره فقط برای مدیر ربات نمایش داده می‌شود.", reply_markup=keyboard((MENU,)))
 
 
 @dp.message(AddProperty.phone, ~F.text.startswith("/"))
 async def add_phone(message: Message, state: FSMContext):
     data = await state.get_data()
-    phone = (message.text or "").strip().translate(
-        str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
-    )
-    if phone in ("بدون شماره", "از طریق مشاور"):
-        phone = None
-    elif not re.fullmatch(r"(?:0|\+98)9[0-9]{9}", phone):
-        await message.answer("شماره موبایل را با 09 یا +98 وارد کنید یا «بدون شماره» را بزنید.")
+    phone = mobile_number(message.text or "")
+    if not phone:
+        await message.answer("شماره موبایل را با 09 یا +98 وارد کنید.")
         return
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
@@ -368,13 +396,15 @@ async def add_phone(message: Message, state: FSMContext):
         f"ملک شماره {property_id} ثبت شد و در انتظار بررسی دفتر است.",
         reply_markup=main_menu(message.from_user.id)
     )
-    for admin_id in ADMIN_IDS:
-        try:
-            await message.bot.send_message(
-                admin_id, f"ملک جدید شماره {property_id} ثبت شد. برای بررسی /pending را بزنید."
-            )
-        except Exception:
-            logging.warning("Could not notify admin %s", admin_id)
+    await notify_owner(
+        message.bot,
+        f"🏠 ملک جدید شماره {property_id}\n"
+        f"{data['deal_type']} | {data['property_type']} | {data['area']}\n"
+        f"متراژ: {data['size_m2'] or 'ثبت نشده'}\n"
+        f"مبلغ: {format_price(data['price_toman'])}\n"
+        f"توضیحات: {data['details']}\nشماره فروشنده: {phone}",
+        reply_button("seller", property_id),
+    )
 
 
 async def extract_search_filters(query: str) -> dict:
@@ -408,6 +438,9 @@ async def extract_search_filters(query: str) -> dict:
 
 @dp.message(Command("search"))
 async def search(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await start_lead(message, state)
+        return
     query = (message.text or "").partition(" ")[2].strip()
     if not query:
         await message.answer("عبارت جست‌وجو را بعد از فرمان بنویس.\nمثال: /search آپارتمان در شهرک گلستان تا ۸ میلیارد")
@@ -466,32 +499,47 @@ async def show_results(message: Message, filters: dict):
 async def lead(message: Message, state: FSMContext):
     request_text = (message.text or "").partition(" ")[2].strip()
     if not request_text:
-        await message.answer("درخواستت را بعد از فرمان بنویس.\nمثال: /lead آپارتمان ۱۳۰ متری در گلستان تا ۱۰ میلیارد")
+        await start_lead(message, state)
         return
-    await save_lead(message, state, request_text)
+    await state.clear()
+    await ask_buyer_phone(message, state, request_text)
 
 
-async def save_lead(message: Message, state: FSMContext, request_text: str):
+async def ask_buyer_phone(message, state, request_text):
+    await state.update_data(request_text=request_text[:1500])
+    await state.set_state(BuyerRequest.phone)
+    await message.answer(
+        "شماره موبایل را با 09 یا +98 بفرستید. شماره فقط برای مدیر ربات نمایش داده می‌شود.",
+        reply_markup=keyboard((MENU,)),
+    )
+
+
+@dp.message(BuyerRequest.phone, ~F.text.startswith("/"))
+async def buyer_phone(message: Message, state: FSMContext):
+    phone = mobile_number(message.text or "")
+    if not phone:
+        await message.answer("شماره موبایل را با 09 یا +98 وارد کنید.")
+        return
+    request_text = (await state.get_data())["request_text"]
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO leads (user_id, username, request_text, created_at) VALUES (?, ?, ?, ?)",
+        cursor = await db.execute(
+            "INSERT INTO leads (user_id, username, request_text, phone, created_at) VALUES (?, ?, ?, ?, ?)",
             (
-                message.from_user.id, message.from_user.username, request_text[:1500],
+                message.from_user.id, message.from_user.username, request_text, phone,
                 datetime.now(TZ).isoformat(timespec="minutes")
             )
         )
+        lead_id = cursor.lastrowid
         await db.commit()
     await state.clear()
-    await message.answer("درخواست شما برای پیگیری دفتر ثبت شد.", reply_markup=main_menu(message.from_user.id))
-    for admin_id in ADMIN_IDS:
-        try:
-            await message.bot.send_message(
-                admin_id,
-                f"📩 درخواست مشتری از @{message.from_user.username or 'بدون نام کاربری'}\n"
-                f"شناسه تلگرام: {message.from_user.id}\nدرخواست: {request_text[:1000]}"
-            )
-        except Exception:
-            pass
+    await message.answer(
+        f"درخواست شماره {lead_id} ثبت شد. پاسخ دفتر در همین چت به شما می‌رسد.",
+        reply_markup=main_menu(message.from_user.id),
+    )
+    await notify_owner(
+        message.bot, f"📩 درخواست خریدار #{lead_id}\n{request_text}\nشماره خریدار: {phone}",
+        reply_button("buyer", lead_id),
+    )
 
 
 @dp.message(Command("myads"))
@@ -520,17 +568,19 @@ async def pending(message: Message):
         return
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM properties WHERE status='draft' ORDER BY id DESC LIMIT 20")
+        cur = await db.execute(
+            "SELECT * FROM properties WHERE status IN ('draft','reviewed') "
+            "ORDER BY (status='draft') DESC, id DESC LIMIT 20"
+        )
         rows = await cur.fetchall()
     if not rows:
         await message.answer("آگهی پیش‌نویس نداریم.")
         return
     for row in rows:
-        markup = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="تأیید و انتشار", callback_data=f"approve:{row['id']}"),
-            InlineKeyboardButton(text="رد آگهی", callback_data=f"reject:{row['id']}"),
-        ]])
-        await message.answer(property_text(row, admin=True), parse_mode="HTML", reply_markup=markup)
+        await message.answer(
+            property_text(row, admin=True) + f"\nوضعیت: {STATUS[row['status']]}",
+            parse_mode="HTML", reply_markup=reply_button("seller", row["id"]),
+        )
 
 
 @dp.callback_query(F.data.regexp(r"^(?:approve|reject):[0-9]{1,15}$"), F.message.chat.type == "private")
@@ -559,7 +609,7 @@ async def publish_command(message: Message):
         await message.answer("استفاده: /publish شناسه")
         return
     success = await publish_property(message.bot, int(arg))
-    await message.answer("آگهی منتشر شد و در جست‌وجوی ربات نمایش داده می‌شود." if success else "انتشار انجام نشد. وضعیت آگهی و دسترسی کانال را بررسی کنید.")
+    await message.answer("آگهی برای جست‌وجوی داخلی تأیید شد." if success else "آگهی قابل تأیید نیست.")
 
 
 @dp.message(Command("schedule"))
@@ -679,7 +729,7 @@ async def lead_reply(message: Message, state: FSMContext):
             await message.answer("این ملک در دسترس نیست.", reply_markup=main_menu(message.from_user.id))
             return
         description = f"درخواست بازدید از ملک شماره {property_id}\n{description}"
-    await save_lead(message, state, description)
+    await ask_buyer_phone(message, state, description)
 
 
 @dp.message(Command("leads"))
@@ -689,18 +739,75 @@ async def admin_leads(message: Message):
         return
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM leads ORDER BY id DESC LIMIT 10")
+        cursor = await db.execute(
+            "SELECT * FROM leads ORDER BY (replied_at IS NULL) DESC, id DESC LIMIT 10"
+        )
         rows = await cursor.fetchall()
     if not rows:
         await message.answer("درخواستی ثبت نشده است.")
         return
     for row in rows:
-        url = f"https://t.me/{row['username']}" if row["username"] else f"tg://user?id={row['user_id']}"
-        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="پیام به مشتری", url=url)]])
+        status = "پاسخ ارسال شد" if row["replied_at"] else "در انتظار بررسی"
         await message.answer(
-            f"درخواست {row['id']} | {row['created_at']}\n{row['request_text']}",
-            reply_markup=markup,
+            f"درخواست {row['id']} | {status}\n{row['request_text']}\n"
+            f"شماره خریدار: {row['phone'] or 'در فیلد جداگانه ثبت نشده'}",
+            reply_markup=reply_button("buyer", row["id"]),
         )
+
+
+@dp.callback_query(F.data.regexp(r"^ownerreply:(buyer|seller):[0-9]{1,19}$"), F.message.chat.type == "private")
+async def prepare_owner_reply(query: CallbackQuery, state: FSMContext):
+    if not is_admin(query.from_user.id):
+        await query.answer("این گزینه فقط برای مدیر فعال است.", show_alert=True)
+        return
+    _, kind, raw_id = query.data.split(":")
+    await query.answer()
+    await state.set_data({"kind": kind, "record_id": int(raw_id)})
+    await state.set_state(OwnerReply.text)
+    label = "درخواست خریدار" if kind == "buyer" else "ملک فروشنده"
+    await query.message.answer(
+        f"پاسخ خود را برای {label} شماره {raw_id} بنویسید. "
+        "با فرستادن متن، پیام به ثبت‌کننده ارسال می‌شود.",
+        reply_markup=keyboard((MENU,)),
+    )
+
+
+@dp.message(OwnerReply.text, F.text, ~F.text.startswith("/"))
+async def send_owner_reply(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    answer = message.text.strip()
+    if not 0 < len(answer) <= 3500:
+        await message.answer("پاسخ را در یک پیام حداکثر ۳۵۰۰ نویسه بنویسید.")
+        return
+    data = await state.get_data()
+    record_id = data["record_id"]
+    is_buyer = data["kind"] == "buyer"
+    select = "SELECT user_id FROM leads WHERE id=?" if is_buyer else "SELECT owner_user_id FROM properties WHERE id=?"
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(select, (record_id,)) as cursor:
+            record = await cursor.fetchone()
+        if not record:
+            await state.clear()
+            await message.answer("این ثبت پیدا نشد.", reply_markup=main_menu(message.from_user.id))
+            return
+        label = "درخواست" if is_buyer else "ملک"
+        try:
+            await message.bot.send_message(record[0], f"پیام دفتر دربارهٔ {label} شماره {record_id}\n\n{answer}")
+        except TelegramAPIError:
+            await message.answer("پیام نرسید. می‌توانید دوباره تلاش کنید یا به منوی اصلی برگردید.")
+            return
+        if is_buyer:
+            await db.execute(
+                "UPDATE leads SET replied_at=? WHERE id=?",
+                (datetime.now(TZ).isoformat(timespec="minutes"), record_id),
+            )
+        else:
+            await db.execute("UPDATE properties SET status='reviewed' WHERE id=? AND status='draft'", (record_id,))
+        await db.commit()
+    await state.clear()
+    await message.answer("پاسخ ارسال شد.", reply_markup=main_menu(message.from_user.id))
 
 
 @dp.message(Command("reject", "close"))
@@ -720,7 +827,7 @@ async def close_property(message: Message):
         async with publication_lock, aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute(
                 "UPDATE properties SET status='closed', scheduled_at=NULL "
-                "WHERE id=? AND owner_user_id=? AND status IN ('draft','scheduled','published')",
+                "WHERE id=? AND owner_user_id=? AND status IN ('draft','reviewed','scheduled','published')",
                 (int(value), message.from_user.id),
             )
             await db.commit()
@@ -745,8 +852,8 @@ async def unknown_message(message: Message):
 
 
 async def main():
-    if not ADMIN_IDS:
-        raise RuntimeError("ADMIN_IDS باید شامل شناسه عددی مدیر تلگرام باشد.")
+    if not OWNER_ID.isascii() or not OWNER_ID.isdecimal() or int(OWNER_ID) <= 0:
+        raise RuntimeError("OWNER_ID یا ADMIN_IDS تک‌نفره را با شناسه عددی مدیر تنظیم کنید.")
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN در فایل .env تنظیم نشده است.")
     await init_db()
