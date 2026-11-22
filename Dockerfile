@@ -4,5 +4,5 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY bot.py .
 ENV DB_PATH=/data/amlak.db
-VOLUME ["/data"]
+RUN mkdir -p /data
 CMD ["python", "bot.py"]
