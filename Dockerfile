@@ -8,3 +8,4 @@ COPY bot.py .
 ENV DB_PATH=/data/amlak.db
 RUN mkdir -p /data
 CMD ["python", "bot.py"]
+
