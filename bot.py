@@ -14,7 +14,7 @@ import aiosqlite
 import arabic_reshaper
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramAPIError
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (BotCommand, BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -48,7 +48,11 @@ AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini").strip()
 TZ = ZoneInfo("Asia/Tehran")
 
 dp = Dispatcher(fsm_strategy=FSMStrategy.USER_IN_CHAT)
-dp.message.filter(F.chat.type == "private")
+dp.message.filter(
+    (F.chat.type == "private")
+    | (F.chat.type.in_({"group", "supergroup"})
+       & F.text.regexp(r"^/sldgroup(?:@[A-Za-z0-9_]+)?$"))
+)
 publication_lock = asyncio.Lock()
 
 CATALOG = "🏘 ملک‌های موجود"
@@ -180,6 +184,18 @@ async def init_db():
             created_at TEXT NOT NULL
         )
         """)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS listing_group (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            chat_id INTEGER NOT NULL
+        )
+        """)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS listing_group_posts (
+            property_id INTEGER PRIMARY KEY,
+            posted_at TEXT
+        )
+        """)
         # Older releases approved listings for internal use only. Queue them
         # once for explicit approval before making the catalog public.
         async with db.execute("PRAGMA table_info(properties)") as cursor:
@@ -279,6 +295,82 @@ async def publish_due_jobs(bot: Bot):
         rows = await cur.fetchall()
     for row in rows:
         await publish_property(bot, row["id"], due_at=now)
+
+
+@dp.message(Command("sldgroup"), F.chat.type.in_({"group", "supergroup"}))
+async def connect_listing_group(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO listing_group (singleton, chat_id) VALUES (1, ?) "
+            "ON CONFLICT(singleton) DO UPDATE SET chat_id=excluded.chat_id",
+            (message.chat.id,),
+        )
+        await db.commit()
+    await message.answer("گروه آگهی‌های SLD متصل شد. آگهی‌ها با کد ملک منتشر می‌شوند.")
+
+
+async def send_listing_group_posts(bot: Bot):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        destination = await db.execute_fetchall("SELECT chat_id FROM listing_group")
+        if not destination:
+            return
+        rows = await db.execute_fetchall("""
+            SELECT p.id, p.deal_type, p.property_type, p.area, p.size_m2, p.price_toman
+            FROM listing_group_posts AS posts
+            JOIN properties AS p ON p.id = posts.property_id
+            WHERE posts.posted_at IS NULL AND p.status NOT IN ('closed', 'rejected')
+            ORDER BY p.id LIMIT 20
+        """)
+        if not rows:
+            return
+        try:
+            username = (await bot.me()).username
+            for row in rows:
+                code = row["id"]
+                markup = InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(
+                        text="پیگیری از دفتر",
+                        url=f"https://t.me/{username}?start=listing_{code}",
+                    )
+                ]])
+                await bot.send_message(
+                    destination[0]["chat_id"],
+                    "🏠 " + "\n".join(public_lines(row))
+                    + "\n\nبرای اطلاعات بیشتر یا هماهنگی بازدید، کد ملک را به شهر املاک پناهی اعلام کنید."
+                    + "\nنشانی دفتر: صدرا، فاز ۲، بلوار پارسه، ساختمان افرا",
+                    reply_markup=markup,
+                )
+                await db.execute(
+                    "UPDATE listing_group_posts SET posted_at=? WHERE property_id=?",
+                    (datetime.now(TZ).isoformat(timespec="seconds"), code),
+                )
+                await db.commit()
+        except TelegramAPIError as exc:
+            logging.warning("SLD group post deferred: %s", type(exc).__name__)
+
+
+@dp.message(CommandStart(deep_link=True, magic=F.args.regexp(r"^listing_[0-9]{1,15}$")))
+async def inquire_group_listing(message: Message, state: FSMContext, command: CommandObject):
+    await state.clear()
+    property_id = int(command.args.removeprefix("listing_"))
+    async with aiosqlite.connect(DB_PATH) as db:
+        available = await db.execute_fetchall("""
+            SELECT 1 FROM listing_group_posts AS posts
+            JOIN properties AS p ON p.id = posts.property_id
+            WHERE p.id = ? AND posts.posted_at IS NOT NULL AND p.status NOT IN ('closed', 'rejected')
+        """, (property_id,))
+    if not available:
+        await message.answer("این ملک در دسترس نیست.", reply_markup=main_menu(message.from_user.id))
+        return
+    await state.set_state(BuyerRequest.description)
+    await state.update_data(category=f"پیگیری گروه SLD، کد ملک {property_id}")
+    await message.answer(
+        f"برای پیگیری ملک با کد {property_id}، درخواست خود را برای دفتر بنویسید.",
+        reply_markup=keyboard((MENU,)),
+    )
 
 
 @dp.message(CommandStart())
@@ -768,6 +860,7 @@ async def add_phone(message: Message, state: FSMContext):
             )
         )
         property_id = cur.lastrowid
+        await db.execute("INSERT INTO listing_group_posts (property_id) VALUES (?)", (property_id,))
         await db.commit()
     await state.clear()
     await message.answer(
@@ -1255,6 +1348,8 @@ async def main():
         BotCommand(command="id", description="شناسه تلگرام من"),
     ])
     scheduler.add_job(publish_due_jobs, "interval", seconds=30, args=[bot], id="publish_due")
+    scheduler.add_job(send_listing_group_posts, "interval", seconds=15, args=[bot],
+                      id="sld_group_posts", max_instances=1)
     scheduler.start()
     logging.info("Shahr Amlak bot is running...")
     try:
