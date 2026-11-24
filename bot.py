@@ -103,6 +103,11 @@ class SearchProperty(StatesGroup):
 
 
 class BuyerRequest(StatesGroup):
+    deal = State()
+    property_type = State()
+    area = State()
+    size = State()
+    budget = State()
     description = State()
     viewing = State()
     phone = State()
@@ -503,16 +508,77 @@ async def start_find(message: Message, state: FSMContext):
     await message.answer("نوع معامله را انتخاب کنید.", reply_markup=keyboard(DEALS, (ANY, MENU)))
 
 
-@dp.message(F.text.in_({LEAD, "📩 درخواست مشاور"}))
+BUYER_DEALS = ("خرید", "رهن و اجاره", "پیش‌خرید")
+
+
+@dp.message(F.text == LEAD)
 async def start_lead(message: Message, state: FSMContext):
     await state.clear()
-    await state.set_state(BuyerRequest.description)
-    await message.answer(
-        "نوع معامله، شهر و محله، نوع ملک، متراژ و بودجه را در یک پیام بنویسید. "
-        "مثلاً خرید آپارتمان ۱۲۰ متری در صدرا فاز ۲ تا ۸ میلیارد تومان. "
-        "شماره تماس را در مرحلهٔ بعد می‌گیریم.",
-        reply_markup=keyboard((MENU,)),
+    await state.set_state(BuyerRequest.deal)
+    await message.answer("نوع معامله را انتخاب کنید.", reply_markup=keyboard(BUYER_DEALS, (MENU,)))
+
+
+@dp.message(BuyerRequest.deal, F.text, ~F.text.startswith("/"))
+async def lead_deal(message: Message, state: FSMContext):
+    if message.text not in BUYER_DEALS:
+        await message.answer("یکی از دکمه‌های نوع معامله را انتخاب کنید.")
+        return
+    await state.update_data(deal=message.text)
+    await state.set_state(BuyerRequest.property_type)
+    await message.answer("دنبال چه نوع ملکی هستید؟", reply_markup=keyboard(TYPES[:3], TYPES[3:], (MENU,)))
+
+
+@dp.message(BuyerRequest.property_type, F.text, ~F.text.startswith("/"))
+async def lead_property_type(message: Message, state: FSMContext):
+    if message.text not in TYPES:
+        await message.answer("یکی از دکمه‌های نوع ملک را انتخاب کنید.")
+        return
+    await state.update_data(property_type=message.text)
+    await state.set_state(BuyerRequest.area)
+    await message.answer("شهر و محله را بنویسید. مثلاً صدرا، فاز ۲.", reply_markup=keyboard((MENU,)))
+
+
+@dp.message(BuyerRequest.area, F.text, ~F.text.startswith("/"))
+async def lead_area(message: Message, state: FSMContext):
+    area = message.text.strip()
+    if not 0 < len(area) <= 120:
+        await message.answer("شهر و محله را در حداکثر ۱۲۰ نویسه بنویسید.")
+        return
+    await state.update_data(area=area)
+    await state.set_state(BuyerRequest.size)
+    await message.answer("متراژ دلخواه را به متر مربع وارد کنید. اگر فرقی ندارد، صفر بفرستید.")
+
+
+@dp.message(BuyerRequest.size, F.text, ~F.text.startswith("/"))
+async def lead_size(message: Message, state: FSMContext):
+    size = toman_number(message.text)
+    if size is None or size > 100000:
+        await message.answer("متراژ را به عدد بین صفر و ۱۰۰٬۰۰۰ وارد کنید.")
+        return
+    await state.update_data(size=size)
+    await state.set_state(BuyerRequest.budget)
+    data = await state.get_data()
+    amount = "سقف مبلغ رهن" if data["deal"] == "رهن و اجاره" else "سقف بودجهٔ خرید"
+    await message.answer(f"{amount} را به تومان وارد کنید. اگر مشخص نیست، صفر بفرستید.")
+
+
+@dp.message(BuyerRequest.budget, F.text, ~F.text.startswith("/"))
+async def lead_budget(message: Message, state: FSMContext):
+    budget = toman_number(message.text)
+    if budget is None:
+        await message.answer("مبلغ کامل را به تومان وارد کنید. اگر مشخص نیست، صفر بفرستید.")
+        return
+    data = await state.get_data()
+    size = f"{data['size']:,} متر مربع" if data["size"] else "فرقی ندارد"
+    amount = "سقف رهن" if data["deal"] == "رهن و اجاره" else "سقف بودجه"
+    budget_text = f"{budget:,} تومان" if budget else "مشخص نشده"
+    request = (
+        f"{data['deal']} | {data['property_type']}\n"
+        f"شهر و محله: {data['area']}\n"
+        f"متراژ: {size}\n"
+        f"{amount}: {budget_text}"
     )
+    await ask_buyer_phone(message, state, request)
 
 
 @dp.message(F.text.in_({MINE, REVIEW, INBOX}))
@@ -1361,4 +1427,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-  
