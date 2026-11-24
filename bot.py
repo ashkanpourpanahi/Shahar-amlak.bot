@@ -17,6 +17,7 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import SimpleEventIsolation
 from aiogram.types import (BotCommand, BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
                            KeyboardButton, Message, ReplyKeyboardMarkup)
 from aiogram.fsm.strategy import FSMStrategy
@@ -44,10 +45,13 @@ OWNER_ID = os.getenv("OWNER_ID", "").strip() or (
 DB_PATH = os.getenv("DB_PATH", "amlak.db")
 AI_API_KEY = os.getenv("AI_API_KEY", "").strip()
 AI_BASE_URL = os.getenv("AI_BASE_URL", "").strip() or None
+VOICE_MODEL = os.getenv("VOICE_MODEL", "gpt-4o-mini-transcribe").strip()
+VOICE_LIMIT_BYTES = 5_000_000
+VOICE_LIMIT_SECONDS = 60
 AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini").strip()
 TZ = ZoneInfo("Asia/Tehran")
 
-dp = Dispatcher(fsm_strategy=FSMStrategy.USER_IN_CHAT)
+dp = Dispatcher(fsm_strategy=FSMStrategy.USER_IN_CHAT, events_isolation=SimpleEventIsolation())
 dp.message.filter(
     (F.chat.type == "private")
     | (F.chat.type.in_({"group", "supergroup"})
@@ -89,7 +93,7 @@ def keyboard(*rows):
 
 
 def main_menu(user_id):
-    rows = [(LEAD, ADD), (CATALOG, BUYER_PDF), (CONSULT, AGENCY), (MINE,)]
+    rows = [(LEAD, ADD), (FIND, CATALOG), (BUYER_PDF,), (CONSULT, AGENCY), (MINE,)]
     if is_admin(user_id):
         rows.extend([(REVIEW, INBOX), (OFFICE_VISIT, DAILY_REPORT)])
     return keyboard(*rows)
@@ -235,6 +239,30 @@ def mobile_number(text):
         str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
     )
     return digits if re.fullmatch(r"(?:0|\+98)9[0-9]{9}", digits) else None
+
+
+def lead_phone_number(message: Message):
+    contact = message.contact
+    if contact and contact.user_id == message.from_user.id:
+        number = contact.phone_number
+        return mobile_number("+" + number if number.startswith("98") else number)
+    return mobile_number(message.text or "")
+
+
+def phone_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="ارسال شمارهٔ خودم", request_contact=True)],
+            [KeyboardButton(text=MENU)],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def with_voice_option(prompt: str) -> str:
+    if AI_API_KEY:
+        return prompt + "\nبرای تبدیل ویس فارسی به متن، همین‌جا ویس بفرستید. صدا برای تبدیل به سرویس هوش مصنوعی ارسال می‌شود."
+    return prompt
 
 
 def reply_button(kind, record_id):
@@ -470,8 +498,9 @@ async def contact_office(message: Message, state: FSMContext):
     await state.clear()
     await state.set_state(BuyerRequest.description)
     await state.update_data(category="مشاوره" if message.text == CONSULT else "تقاضای دفتر همکار")
-    await message.answer("موضوع مشاوره را بنویسید." if message.text == CONSULT else
-                         "نام دفتر و مشخصات ملک درخواستی مشتری را بنویسید.",
+    prompt = ("موضوع مشاوره را بنویسید." if message.text == CONSULT else
+              "نام دفتر و مشخصات ملک درخواستی مشتری را بنویسید.")
+    await message.answer(with_voice_option(prompt),
                          reply_markup=keyboard((MENU,)))
 
 
@@ -508,7 +537,8 @@ async def start_find(message: Message, state: FSMContext):
     await message.answer("نوع معامله را انتخاب کنید.", reply_markup=keyboard(DEALS, (ANY, MENU)))
 
 
-BUYER_DEALS = ("خرید", "رهن و اجاره", "پیش‌خرید")
+BUYER_DEAL_TO_LISTING = {"خرید": "فروش", "رهن و اجاره": "رهن و اجاره", "پیش‌خرید": "پیش‌فروش"}
+BUYER_DEALS = tuple(BUYER_DEAL_TO_LISTING)
 
 
 @dp.message(F.text == LEAD)
@@ -535,7 +565,7 @@ async def lead_property_type(message: Message, state: FSMContext):
         return
     await state.update_data(property_type=message.text)
     await state.set_state(BuyerRequest.area)
-    await message.answer("شهر و محله را بنویسید. مثلاً صدرا، فاز ۲.", reply_markup=keyboard((MENU,)))
+    await message.answer(with_voice_option("شهر و محله را بنویسید. مثلاً صدرا، فاز ۲."), reply_markup=keyboard((MENU,)))
 
 
 @dp.message(BuyerRequest.area, F.text, ~F.text.startswith("/"))
@@ -578,6 +608,8 @@ async def lead_budget(message: Message, state: FSMContext):
         f"متراژ: {size}\n"
         f"{amount}: {budget_text}"
     )
+    await state.update_data(budget=budget)
+    await message.answer("خلاصهٔ درخواست شما\n" + request)
     await ask_buyer_phone(message, state, request)
 
 
@@ -856,10 +888,10 @@ async def add_type(message: Message, state: FSMContext):
         return
     await state.update_data(property_type=message.text)
     await state.set_state(AddProperty.area)
-    await message.answer("محله و شهر را بنویسید. مثلاً فاز ۲ صدرا.", reply_markup=keyboard((MENU,)))
+    await message.answer(with_voice_option("محله و شهر را بنویسید. مثلاً فاز ۲ صدرا."), reply_markup=keyboard((MENU,)))
 
 
-@dp.message(AddProperty.area, ~F.text.startswith("/"))
+@dp.message(AddProperty.area, F.text, ~F.text.startswith("/"))
 async def add_area(message: Message, state: FSMContext):
     if not (message.text or "").strip():
         await message.answer("نام محله و شهر را به صورت متن بفرستید.")
@@ -892,23 +924,24 @@ async def add_price(message: Message, state: FSMContext):
     await state.set_state(AddProperty.details)
     data = await state.get_data()
     extra = " مبلغ اجاره ماهانه را هم ذکر کنید." if data["deal_type"] == "رهن و اجاره" else ""
-    await message.answer("ویژگی‌های ملک و شرایط پرداخت را بنویسید. شماره تماس را در توضیحات نگذارید." + extra)
+    await message.answer(with_voice_option("ویژگی‌های ملک و شرایط پرداخت را بنویسید. شماره تماس را در توضیحات نگذارید." + extra))
 
 
-@dp.message(AddProperty.details, ~F.text.startswith("/"))
+@dp.message(AddProperty.details, F.text, ~F.text.startswith("/"))
 async def add_details(message: Message, state: FSMContext):
     if not (message.text or "").strip():
         await message.answer("توضیحات را به صورت متن بفرستید.")
         return
     await state.update_data(details=message.text.strip()[:1500])
     await state.set_state(AddProperty.phone)
-    await message.answer("شماره موبایل را با 09 یا +98 بفرستید. شماره فقط برای مدیر ربات نمایش داده می‌شود.", reply_markup=keyboard((MENU,)))
+    await message.answer("شماره موبایل را با 09 یا +98 وارد کنید یا دکمهٔ ارسال شماره را بزنید.", reply_markup=phone_keyboard())
 
 
-@dp.message(AddProperty.phone, ~F.text.startswith("/"))
+@dp.message(AddProperty.phone, F.contact)
+@dp.message(AddProperty.phone, F.text, ~F.text.startswith("/"))
 async def add_phone(message: Message, state: FSMContext):
     data = await state.get_data()
-    phone = mobile_number(message.text or "")
+    phone = lead_phone_number(message)
     if not phone:
         await message.answer("شماره موبایل را با 09 یا +98 وارد کنید.")
         return
@@ -994,8 +1027,10 @@ async def show_results(message: Message, filters: dict):
     for key, column in [("area", "area"), ("property_type", "property_type"), ("deal_type", "deal_type")]:
         value = str(filters.get(key) or "").strip()
         if value:
-            sql += f" AND instr({column}, ?) > 0"
-            params.append(value)
+            terms = re.findall(r"[^\s،,]+", value) if key == "area" else [value]
+            for term in terms:
+                sql += f" AND instr({column}, ?) > 0"
+                params.append(term)
 
     max_price = filters.get("max_price_toman")
     if type(max_price) is int and 0 < max_price <= 999_999_999_999_999:
@@ -1046,18 +1081,20 @@ async def ask_buyer_phone(message, state, request_text):
     await state.update_data(request_text=request_text[:1500])
     await state.set_state(BuyerRequest.phone)
     await message.answer(
-        "شماره موبایل را با 09 یا +98 بفرستید. شماره فقط برای مدیر ربات نمایش داده می‌شود.",
-        reply_markup=keyboard((MENU,)),
+        "شماره موبایل را با 09 یا +98 وارد کنید یا دکمهٔ ارسال شماره را بزنید.",
+        reply_markup=phone_keyboard(),
     )
 
 
-@dp.message(BuyerRequest.phone, ~F.text.startswith("/"))
+@dp.message(BuyerRequest.phone, F.contact)
+@dp.message(BuyerRequest.phone, F.text, ~F.text.startswith("/"))
 async def buyer_phone(message: Message, state: FSMContext):
-    phone = mobile_number(message.text or "")
+    phone = lead_phone_number(message)
     if not phone:
         await message.answer("شماره موبایل را با 09 یا +98 وارد کنید.")
         return
-    request_text = (await state.get_data())["request_text"]
+    data = await state.get_data()
+    request_text = data["request_text"]
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             "INSERT INTO leads (user_id, username, request_text, phone, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -1077,6 +1114,14 @@ async def buyer_phone(message: Message, state: FSMContext):
         message.bot, f"📩 درخواست خریدار #{lead_id}\n{request_text}\nشماره خریدار: {phone}",
         reply_button("buyer", lead_id),
     )
+    if data.get("deal"):
+        await show_results(message, {
+            "deal_type": BUYER_DEAL_TO_LISTING[data["deal"]],
+            "property_type": data["property_type"],
+            "area": data["area"],
+            "min_size_m2": data["size"],
+            "max_price_toman": data["budget"],
+        })
 
 
 @dp.message(Command("myads"))
@@ -1256,13 +1301,13 @@ async def request_visit(query: CallbackQuery, state: FSMContext):
     await state.set_data({"property_id": property_id})
     await state.set_state(BuyerRequest.viewing)
     await query.message.answer(
-        "زمان پیشنهادی بازدید و در صورت تمایل شماره تماس را بفرستید. دفتر برای هماهنگی از این پیام استفاده می‌کند.",
+        with_voice_option("زمان پیشنهادی بازدید را بفرستید. شماره تماس در مرحلهٔ بعد دریافت می‌شود."),
         reply_markup=keyboard((MENU,)),
     )
 
 
-@dp.message(BuyerRequest.viewing, ~F.text.startswith("/"))
-@dp.message(BuyerRequest.description, ~F.text.startswith("/"))
+@dp.message(BuyerRequest.viewing, F.text, ~F.text.startswith("/"))
+@dp.message(BuyerRequest.description, F.text, ~F.text.startswith("/"))
 async def lead_reply(message: Message, state: FSMContext):
     description = (message.text or "").strip()
     if not 0 < len(description) <= 1400:
@@ -1396,6 +1441,46 @@ async def reject_property(property_id: int):
         return bool(cursor.rowcount)
 
 
+VOICE_STEPS = {
+    BuyerRequest.area.state: lead_area,
+    BuyerRequest.description.state: lead_reply,
+    BuyerRequest.viewing.state: lead_reply,
+    AddProperty.area.state: add_area,
+    AddProperty.details.state: add_details,
+}
+
+
+@dp.message(F.voice)
+async def receive_voice(message: Message, state: FSMContext):
+    step = VOICE_STEPS.get(await state.get_state())
+    if not AI_API_KEY or step is None:
+        await message.answer("در این مرحله از دکمه‌ها یا ورودی متنی استفاده کنید.")
+        return
+    voice = message.voice
+    if voice.duration > VOICE_LIMIT_SECONDS or not voice.file_size or voice.file_size > VOICE_LIMIT_BYTES:
+        await message.answer("ویس باید حداکثر یک دقیقه و ۵ مگابایت باشد.")
+        return
+    try:
+        async with asyncio.timeout(30):
+            recording = await message.bot.download(voice)
+            async with AsyncOpenAI(api_key=AI_API_KEY, base_url=AI_BASE_URL, max_retries=0) as client:
+                result = await client.audio.transcriptions.create(
+                    file=("voice.ogg", recording.getvalue(), "audio/ogg"),
+                    model=VOICE_MODEL,
+                    language="fa",
+                )
+    except Exception as exc:
+        logging.warning("Voice transcription unavailable: %s", type(exc).__name__)
+        await message.answer("تبدیل ویس انجام نشد. دوباره ویس بفرستید یا پاسخ را تایپ کنید.")
+        return
+    transcript = result.text.strip()
+    if not transcript:
+        await message.answer("متنی از ویس تشخیص داده نشد. دوباره امتحان کنید یا پاسخ را تایپ کنید.")
+        return
+    await message.answer("متن تشخیص‌داده‌شده:\n" + transcript[:1500])
+    await step(message.model_copy(update={"text": transcript}), state)
+
+
 @dp.message()
 async def unknown_message(message: Message):
     await message.answer("برای ادامه یکی از گزینه‌ها را انتخاب کنید.", reply_markup=main_menu(message.from_user.id))
@@ -1417,9 +1502,9 @@ async def main():
     scheduler.add_job(send_listing_group_posts, "interval", seconds=15, args=[bot],
                       id="sld_group_posts", max_instances=1)
     scheduler.start()
-    logging.info("Shahr Amlak bot is running...")
+    logging.info("Shahr Amlak bot is running. Commit: %s", os.getenv("RAILWAY_GIT_COMMIT_SHA", "local"))
     try:
-        await dp.start_polling(bot, handle_as_tasks=False)
+        await dp.start_polling(bot, handle_as_tasks=True)
     finally:
         scheduler.shutdown(wait=False)
         await bot.session.close()
