@@ -14,7 +14,7 @@ import aiosqlite
 import arabic_reshaper
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramAPIError
-from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import SimpleEventIsolation
@@ -69,6 +69,8 @@ FIND = "🔎 پیدا کردن ملک"
 ADD = "🏠 فروشنده‌ام"
 LEAD = "🔎 خریدارم"
 MINE = "📋 ثبت‌های من"
+MY_REQUESTS = "📨 پیگیری درخواست‌ها"
+PARTNERSHIP = "🤝 مشارکت در ساخت"
 REVIEW = "✅ بررسی آگهی‌ها"
 INBOX = "📥 درخواست مشتریان"
 OFFICE_VISIT = "📝 ثبت مراجعه"
@@ -78,6 +80,9 @@ VISIT_SOURCES = ("حضوری", "تلفنی")
 VISIT_STATUSES = ("در انتظار پیگیری", "پیگیری شد")
 MENU = "↩️ منوی اصلی"
 ANY = "همه موارد"
+CITIES = ("شیراز", "صدرا")
+SADRA_PHASES = ("صدرا فاز ۱", "صدرا فاز ۲")
+SKIP_AREA = "بدون انتخاب محله"
 DEALS = ("فروش", "رهن و اجاره", "پیش‌فروش")
 TYPES = ("آپارتمان", "زمین", "مغازه", "ویلا", "اداری", "سایر")
 STATUS = {"draft": "در انتظار بررسی", "scheduled": "زمان‌بندی‌شده",
@@ -93,7 +98,7 @@ def keyboard(*rows):
 
 
 def main_menu(user_id):
-    rows = [(LEAD, ADD), (FIND, CATALOG), (BUYER_PDF,), (CONSULT, AGENCY), (MINE,)]
+    rows = [(LEAD, ADD), (FIND, CATALOG), (BUYER_PDF,), (CONSULT, PARTNERSHIP), (AGENCY,), (MINE, MY_REQUESTS)]
     if is_admin(user_id):
         rows.extend([(REVIEW, INBOX), (OFFICE_VISIT, DAILY_REPORT)])
     return keyboard(*rows)
@@ -102,6 +107,7 @@ def main_menu(user_id):
 class SearchProperty(StatesGroup):
     deal = State()
     kind = State()
+    city = State()
     area = State()
     budget = State()
 
@@ -109,6 +115,7 @@ class SearchProperty(StatesGroup):
 class BuyerRequest(StatesGroup):
     deal = State()
     property_type = State()
+    city = State()
     area = State()
     size = State()
     budget = State()
@@ -135,11 +142,54 @@ scheduler = AsyncIOScheduler(timezone=TZ)
 class AddProperty(StatesGroup):
     deal_type = State()
     property_type = State()
+    city = State()
     area = State()
     size = State()
     price = State()
     details = State()
     phone = State()
+
+
+LOCATION_STATES = {
+    form.city.state: form for form in (BuyerRequest, AddProperty, SearchProperty)
+}
+
+
+async def ask_location(message: Message, state: FSMContext, form):
+    await state.set_state(form.city)
+    extra = (CITIES[1], ANY) if form is SearchProperty else ()
+    rows = [(CITIES[0], *SADRA_PHASES)]
+    if extra:
+        rows.append(extra)
+    await message.answer("محدودهٔ ملک را انتخاب کنید.", reply_markup=keyboard(*rows, (MENU,)))
+
+
+async def ask_neighborhood(message: Message, state: FSMContext, form):
+    await state.set_state(form.area)
+    await message.answer(
+        with_voice_option("نام محله را وارد کنید، یا دکمهٔ پایین را بزنید."),
+        reply_markup=keyboard((SKIP_AREA, MENU)),
+    )
+
+
+@dp.message(StateFilter(*LOCATION_STATES), F.text, ~F.text.startswith("/"))
+async def select_location(message: Message, state: FSMContext):
+    form = LOCATION_STATES[await state.get_state()]
+    choice = message.text
+    if choice in SADRA_PHASES:
+        await state.update_data(city=CITIES[1], phase=SADRA_PHASES.index(choice) + 1)
+    elif choice == CITIES[0] or (form is SearchProperty and choice in (CITIES[1], ANY)):
+        await state.update_data(city=None if choice == ANY else choice, phase=None)
+    else:
+        await message.answer("محدوده را از دکمه‌ها انتخاب کنید.")
+        return
+    await ask_neighborhood(message, state, form)
+
+
+def location_label(data: dict, neighborhood: str) -> str:
+    phase = data.get("phase")
+    city = SADRA_PHASES[phase - 1] if phase else data.get("city")
+    return "، ".join(part for part in (city, neighborhood) if part)
 
 
 def is_admin(user_id: int) -> bool:
@@ -425,7 +475,9 @@ def public_lines(row):
     # Only structured fields are public. Legacy locations containing arbitrary
     # contact information are replaced with a general location label.
     area = row["area"].strip()
-    if not re.fullmatch(r"[آ-غف-یۀءئؤأإ\u200c ]{1,70}(?: [۰-۹0-9]{1,2})?", area):
+    prefix, separator, neighborhood = area.partition("، ")
+    area_to_check = neighborhood if separator and prefix in (*CITIES, *SADRA_PHASES) else area
+    if not re.fullmatch(r"[آ-غف-یۀءئؤأإ\u200c ]{1,70}(?: [۰-۹0-9]{1,2})?", area_to_check):
         area = "محدوده با هماهنگی دفتر"
     kind = row["property_type"] if row["property_type"] in TYPES else "ملک"
     deal = row["deal_type"] if row["deal_type"] in DEALS else "معامله"
@@ -433,17 +485,53 @@ def public_lines(row):
             f"{row['size_m2'] or 'نامشخص'} متر مربع  |  {format_price(row['price_toman'])}"]
 
 
+LOCATION_TRANSLATION = str.maketrans(
+    "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩يك", "01234567890123456789یک"
+)
+PHASE_PATTERN = re.compile(r"فاز[\s‌]*(1|2|یک|دو|اول|دوم)(?![\w‌])")
+PHASE_NUMBERS = {"1": 1, "2": 2, "یک": 1, "دو": 2, "اول": 1, "دوم": 2}
+
+
+def location_matches(area, city, phase, neighborhood):
+    area = area.translate(LOCATION_TRANSLATION).replace("\u200c", " ")
+    place_words = re.findall(r"[^\s،,]+", area)
+    if city and city not in place_words:
+        return False
+    if phase and not any(PHASE_NUMBERS[label] == phase for label in PHASE_PATTERN.findall(area)):
+        return False
+    terms = re.findall(r"[^\s،,]+", (neighborhood or "").translate(LOCATION_TRANSLATION).replace("\u200c", " "))
+    return all(term in area for term in terms)
+
+
 async def inventory(filters, before=None, limit=None):
     sql = """SELECT id, deal_type, property_type, area, size_m2, price_toman
              FROM properties WHERE status='published'"""
     args = []
-    for key in ("deal_type", "property_type", "area"):
-        if filters.get(key):
-            sql += f" AND instr({key}, ?) > 0"
-            args.append(filters[key])
-    if filters.get("max_price_toman"):
+    for field in ("deal_type", "property_type"):
+        if filters.get(field):
+            sql += f" AND instr({field}, ?) > 0"
+            args.append(filters[field])
+    if any(filters.get(key) for key in ("city", "phase", "area")):
+        sql += " AND location_matches(area, ?, ?, ?)"
+        args.extend((filters.get("city"), filters.get("phase"), str(filters.get("area") or "")))
+    max_price = filters.get("max_price_toman")
+    if type(max_price) is int and 0 < max_price <= 999_999_999_999_999:
         sql += " AND price_toman > 0 AND price_toman <= ?"
-        args.append(filters["max_price_toman"])
+        args.append(max_price)
+    min_size = filters.get("min_size_m2")
+    if type(min_size) is int and 0 < min_size <= 100_000:
+        sql += " AND size_m2 >= ?"
+        args.append(min_size)
+    keywords = filters.get("keywords")
+    if isinstance(keywords, list) and not args:
+        words = [str(word).strip() for word in keywords if len(str(word).strip()) >= 2][:6]
+        if words:
+            sql += " AND (" + " OR ".join(
+                "(area LIKE ? OR property_type LIKE ? OR deal_type LIKE ? OR details LIKE ?)"
+                for _ in words
+            ) + ")"
+            for word in words:
+                args.extend([f"%{word}%"] * 4)
     if before:
         sql += " AND id < ?"
         args.append(before)
@@ -453,7 +541,8 @@ async def inventory(filters, before=None, limit=None):
         args.append(limit)
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        return await (await db.execute(sql, args)).fetchall()
+        await db.create_function("location_matches", 4, location_matches, deterministic=True)
+        return await db.execute_fetchall(sql, args)
 
 
 async def catalog_page(message, before=None):
@@ -493,13 +582,16 @@ async def agency_offer(message: Message, state: FSMContext):
     await state.update_data(agency=True)
 
 
-@dp.message(F.text.in_({CONSULT, AGENCY_WANT}))
+@dp.message(F.text.in_({CONSULT, AGENCY_WANT, PARTNERSHIP}))
 async def contact_office(message: Message, state: FSMContext):
     await state.clear()
     await state.set_state(BuyerRequest.description)
-    await state.update_data(category="مشاوره" if message.text == CONSULT else "تقاضای دفتر همکار")
-    prompt = ("موضوع مشاوره را بنویسید." if message.text == CONSULT else
-              "نام دفتر و مشخصات ملک درخواستی مشتری را بنویسید.")
+    category, prompt = {
+        CONSULT: ("مشاوره", "موضوع مشاوره را بنویسید."),
+        AGENCY_WANT: ("تقاضای دفتر همکار", "نام دفتر و مشخصات ملک درخواستی مشتری را بنویسید."),
+        PARTNERSHIP: ("مشارکت در ساخت", "شهر، محله، متراژ زمین و شرایط مدنظر برای مشارکت را بنویسید."),
+    }[message.text]
+    await state.update_data(category=category)
     await message.answer(with_voice_option(prompt),
                          reply_markup=keyboard((MENU,)))
 
@@ -564,8 +656,7 @@ async def lead_property_type(message: Message, state: FSMContext):
         await message.answer("یکی از دکمه‌های نوع ملک را انتخاب کنید.")
         return
     await state.update_data(property_type=message.text)
-    await state.set_state(BuyerRequest.area)
-    await message.answer(with_voice_option("شهر و محله را بنویسید. مثلاً صدرا، فاز ۲."), reply_markup=keyboard((MENU,)))
+    await ask_location(message, state, BuyerRequest)
 
 
 @dp.message(BuyerRequest.area, F.text, ~F.text.startswith("/"))
@@ -574,7 +665,7 @@ async def lead_area(message: Message, state: FSMContext):
     if not 0 < len(area) <= 120:
         await message.answer("شهر و محله را در حداکثر ۱۲۰ نویسه بنویسید.")
         return
-    await state.update_data(area=area)
+    await state.update_data(area="" if area == SKIP_AREA else area)
     await state.set_state(BuyerRequest.size)
     await message.answer("متراژ دلخواه را به متر مربع وارد کنید. اگر فرقی ندارد، صفر بفرستید.")
 
@@ -602,9 +693,10 @@ async def lead_budget(message: Message, state: FSMContext):
     size = f"{data['size']:,} متر مربع" if data["size"] else "فرقی ندارد"
     amount = "سقف رهن" if data["deal"] == "رهن و اجاره" else "سقف بودجه"
     budget_text = f"{budget:,} تومان" if budget else "مشخص نشده"
+    location = location_label(data, data['area'])
     request = (
         f"{data['deal']} | {data['property_type']}\n"
-        f"شهر و محله: {data['area']}\n"
+        f"محدوده: {location}\n"
         f"متراژ: {size}\n"
         f"{amount}: {budget_text}"
     )
@@ -887,8 +979,7 @@ async def add_type(message: Message, state: FSMContext):
         await message.answer("یکی از گزینه‌های نوع ملک را انتخاب کنید.")
         return
     await state.update_data(property_type=message.text)
-    await state.set_state(AddProperty.area)
-    await message.answer(with_voice_option("محله و شهر را بنویسید. مثلاً فاز ۲ صدرا."), reply_markup=keyboard((MENU,)))
+    await ask_location(message, state, AddProperty)
 
 
 @dp.message(AddProperty.area, F.text, ~F.text.startswith("/"))
@@ -896,7 +987,8 @@ async def add_area(message: Message, state: FSMContext):
     if not (message.text or "").strip():
         await message.answer("نام محله و شهر را به صورت متن بفرستید.")
         return
-    await state.update_data(area=message.text.strip()[:120])
+    neighborhood = "" if message.text == SKIP_AREA else message.text.strip()[:95]
+    await state.update_data(area=location_label(await state.get_data(), neighborhood))
     await state.set_state(AddProperty.size)
     await message.answer("متراژ را به عدد وارد کن. اگر مشخص نیست، 0 بنویس.")
 
@@ -1022,39 +1114,7 @@ async def search(message: Message, state: FSMContext):
 
 
 async def show_results(message: Message, filters: dict):
-    sql = "SELECT * FROM properties WHERE status='published'"
-    params = []
-    for key, column in [("area", "area"), ("property_type", "property_type"), ("deal_type", "deal_type")]:
-        value = str(filters.get(key) or "").strip()
-        if value:
-            terms = re.findall(r"[^\s،,]+", value) if key == "area" else [value]
-            for term in terms:
-                sql += f" AND instr({column}, ?) > 0"
-                params.append(term)
-
-    max_price = filters.get("max_price_toman")
-    if type(max_price) is int and 0 < max_price <= 999_999_999_999_999:
-        sql += " AND price_toman <= ?"
-        params.append(int(max_price))
-    min_size = filters.get("min_size_m2")
-    if type(min_size) is int and 0 < min_size <= 100_000:
-        sql += " AND size_m2 >= ?"
-        params.append(int(min_size))
-
-    keywords = filters.get("keywords") or []
-    words = [str(w).strip() for w in keywords if len(str(w).strip()) >= 2][:6] if isinstance(keywords, list) else []
-    if words and not any(filters.get(k) for k in ("area", "property_type", "deal_type", "max_price_toman", "min_size_m2")):
-        conditions = []
-        for word in words:
-            conditions.append("(area LIKE ? OR property_type LIKE ? OR deal_type LIKE ? OR details LIKE ?)")
-            params.extend([f"%{word}%"] * 4)
-        sql += " AND (" + " OR ".join(conditions) + ")"
-
-    sql += " ORDER BY created_at DESC LIMIT 8"
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(sql, params)
-        rows = await cur.fetchall()
+    rows = await inventory(filters, limit=8)
     if not rows:
         await message.answer("ملکی با این مشخصات پیدا نشد. می‌توانید درخواست مشاور ثبت کنید.", reply_markup=main_menu(message.from_user.id))
         return
@@ -1110,8 +1170,9 @@ async def buyer_phone(message: Message, state: FSMContext):
         f"درخواست شماره {lead_id} ثبت شد. پاسخ دفتر در همین چت به شما می‌رسد.",
         reply_markup=main_menu(message.from_user.id),
     )
+    category = data.get("category", "درخواست خریدار")
     await notify_owner(
-        message.bot, f"📩 درخواست خریدار #{lead_id}\n{request_text}\nشماره خریدار: {phone}",
+        message.bot, f"📩 {category} #{lead_id}\n{request_text}\nشماره تماس: {phone}",
         reply_button("buyer", lead_id),
     )
     if data.get("deal"):
@@ -1119,9 +1180,30 @@ async def buyer_phone(message: Message, state: FSMContext):
             "deal_type": BUYER_DEAL_TO_LISTING[data["deal"]],
             "property_type": data["property_type"],
             "area": data["area"],
+            "city": data.get("city"),
+            "phase": data.get("phase"),
             "min_size_m2": data["size"],
             "max_price_toman": data["budget"],
         })
+
+
+@dp.message(F.text == MY_REQUESTS)
+async def my_requests(message: Message, state: FSMContext):
+    await state.clear()
+    async with aiosqlite.connect(DB_PATH) as db:
+        rows = await db.execute_fetchall(
+            "SELECT id, request_text, replied_at FROM leads WHERE user_id=? ORDER BY id DESC LIMIT 10",
+            (message.from_user.id,),
+        )
+    lines = []
+    for code, request, replied_at in rows:
+        subject = request.splitlines()[0][:100]
+        status = "پاسخ دفتر ارسال شد" if replied_at else "در انتظار پاسخ دفتر"
+        lines.append(f"درخواست {code} | {subject} | {status}")
+    await message.answer(
+        "\n".join(lines) or "هنوز درخواستی ثبت نکرده‌اید.",
+        reply_markup=main_menu(message.from_user.id),
+    )
 
 
 @dp.message(Command("myads"))
@@ -1246,17 +1328,16 @@ async def find_kind(message: Message, state: FSMContext):
         await message.answer("نوع ملک را از دکمه‌ها انتخاب کنید.")
         return
     await state.update_data(property_type=None if message.text == ANY else message.text)
-    await state.set_state(SearchProperty.area)
-    await message.answer("نام شهر یا محله را بنویسید. مثلاً صدرا، فاز ۲ یا گلستان.", reply_markup=keyboard(("صدرا", "شیراز"), (ANY, MENU)))
+    await ask_location(message, state, SearchProperty)
 
 
-@dp.message(SearchProperty.area, ~F.text.startswith("/"))
+@dp.message(SearchProperty.area, F.text, ~F.text.startswith("/"))
 async def find_area(message: Message, state: FSMContext):
     area = (message.text or "").strip()
     if not 0 < len(area) <= 120:
         await message.answer("نام شهر یا محله را بنویسید.")
         return
-    await state.update_data(area=None if area == ANY else area)
+    await state.update_data(area=None if area == SKIP_AREA else area)
     await state.set_state(SearchProperty.budget)
     data = await state.get_data()
     if data["deal_type"] == "رهن و اجاره":
@@ -1446,6 +1527,7 @@ VOICE_STEPS = {
     BuyerRequest.description.state: lead_reply,
     BuyerRequest.viewing.state: lead_reply,
     AddProperty.area.state: add_area,
+    SearchProperty.area.state: find_area,
     AddProperty.details.state: add_details,
 }
 
