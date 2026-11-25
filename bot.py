@@ -79,7 +79,8 @@ VISIT_STATUSES = ("در انتظار پیگیری", "پیگیری شد")
 MENU = "↩️ منوی اصلی"
 ANY = "همه موارد"
 PHASE_ONE = "صدرا فاز ۱"
-REGIONS = ("شیراز", PHASE_ONE, "صدرا فاز ۲")
+PHASE_TWO = "صدرا فاز ۲"
+REGIONS = ("شیراز", PHASE_ONE, PHASE_TWO)
 SKIP_NEIGHBORHOOD = "بدون انتخاب محله"
 PHASE_ONE_ROWS = (
     ("100 هکتاری", "128 هکتاری"),
@@ -92,8 +93,27 @@ PHASE_ONE_ROWS = (
     ("90 هکتاری جنوبی", "نیرو انتظامی فاز یک"),
     ("زعفرانیه",),
 )
-PUBLIC_PHASE_ONE_AREAS = {
-    f"{PHASE_ONE}، {name}" for row in PHASE_ONE_ROWS for name in row
+NEIGHBORHOOD_ROWS = {
+    PHASE_ONE: PHASE_ONE_ROWS,
+    PHASE_TWO: (
+        ("115 هکتاری", "26 هکتاری"),
+        ("28 هکتاری", "ارتش"),
+        ("هوابرد", "هلال احمر"),
+        ("هنرستان", "جهاد"),
+        ("جهاد کشاورزی", "کاشی حافظ"),
+        ("کشاورزی", "مخابرات یک"),
+        ("مخابرات دو", "نادر محمدی"),
+        ("ندسا", "نیروی انتظامی"),
+        ("علوم پزشکی", "تربیت بدنی"),
+        ("زمین شهری", "زمزم"),
+        ("زون", "تعاون و امور عشایر"),
+    ),
+}
+PUBLIC_NEIGHBORHOOD_AREAS = {
+    f"{region}، {name}"
+    for region, rows in NEIGHBORHOOD_ROWS.items()
+    for row in rows
+    for name in row
 }
 DEALS = ("فروش", "رهن و اجاره", "پیش‌فروش")
 TYPES = ("آپارتمان", "زمین", "مغازه", "ویلا", "اداری", "سایر")
@@ -121,7 +141,7 @@ async def registration_area(message, state):
     region = (await state.get_data()).get("selected_region")
     if text in REGIONS:
         await state.update_data(selected_region=text)
-        rows = PHASE_ONE_ROWS if text == PHASE_ONE else ()
+        rows = NEIGHBORHOOD_ROWS.get(text, ())
         await message.answer(
             with_voice_option("محله را انتخاب کنید یا نام آن را بنویسید."),
             reply_markup=keyboard(*rows, (SKIP_NEIGHBORHOOD, MENU)),
@@ -465,7 +485,7 @@ def public_lines(row):
     # Only structured fields are public. Legacy locations containing arbitrary
     # contact information are replaced with a general location label.
     area = row["area"].strip()
-    if area not in PUBLIC_PHASE_ONE_AREAS and not re.fullmatch(
+    if area not in PUBLIC_NEIGHBORHOOD_AREAS and not re.fullmatch(
         r"[آ-غف-یۀءئؤأإ\u200c ]{1,70}(?: [۰-۹0-9]{1,2})?", area
     ):
         area = "محدوده با هماهنگی دفتر"
