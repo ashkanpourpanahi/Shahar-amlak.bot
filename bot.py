@@ -80,7 +80,16 @@ MENU = "↩️ منوی اصلی"
 ANY = "همه موارد"
 PHASE_ONE = "صدرا فاز ۱"
 PHASE_TWO = "صدرا فاز ۲"
-REGIONS = ("شیراز", PHASE_ONE, PHASE_TWO)
+SHIRAZ = "شیراز"
+REGIONS = (SHIRAZ, PHASE_ONE, PHASE_TWO)
+SHIRAZ_ROWS_PER_PAGE = 10
+OTHER_SHIRAZ_NEIGHBORHOODS = "سایر محله‌ها"
+BACK_TO_DISTRICTS = "↩️ انتخاب منطقه"
+SHIRAZ_DISTRICTS = tuple(
+    f"منطقه {number}" for number in ("۱", "۲", "۳", "۴", "۵", "۶", "۷", "۸", "۹", "۱۰", "۱۱")
+)
+NEXT_NEIGHBORHOODS = "محله‌های بعدی ▶️"
+PREVIOUS_NEIGHBORHOODS = "◀️ محله‌های قبلی"
 SKIP_NEIGHBORHOOD = "بدون انتخاب محله"
 PHASE_ONE_ROWS = (
     ("100 هکتاری", "128 هکتاری"),
@@ -93,7 +102,161 @@ PHASE_ONE_ROWS = (
     ("90 هکتاری جنوبی", "نیرو انتظامی فاز یک"),
     ("زعفرانیه",),
 )
+# Source: the neighborhood filter on https://divar.ir/s/shiraz
+SHIRAZ_ROWS = (
+    ('آبزنگی', 'آبیاری'),
+    ('آزادگان', 'آزادی'),
+    ('ابیوردی', 'احمدآباد'),
+    ('احمدی جنوبی', 'ارم'),
+    ('اصلاح\u200cنژاد', 'اکبر آباد'),
+    ('امام حسین', 'انجیر'),
+    ('انجیره', 'باباکوهی'),
+    ('باجگاه', 'بازار'),
+    ('باغ تخت', 'باغشهر اهل بیت'),
+    ('باغشهر قصر سبز', 'بالا کفت'),
+    ('باهنر', 'برمشور علیا'),
+    ('بریجستون', 'بعثت'),
+    ('بهارستان', 'بوتان گاز'),
+    ('بید زرد', 'بیمارستان اعصاب و روان محرری'),
+    ('بیمارستان غدیر', 'پادگان بعثت'),
+    ('پادگان نیروی هوایی بعثت', 'پادگان ولیعصر'),
+    ('پارک آزادی', 'پارک کوهستانی بوستان'),
+    ('پانصد دستگاه ارتش', 'پایانه مسافربری سعدی'),
+    ('پشم شیشه', 'پودنک'),
+    ('تاچارا', 'تپه تلویزیون'),
+    ('تحویلی', 'ترمینال باربری'),
+    ('تل حسین\u200cآباد', 'تلخ داش'),
+    ('تندگویان', 'جانبازان'),
+    ('جرسقان', 'جمال آباد'),
+    ('جمهوری', 'جوادیه'),
+    ('چشمه سید صفری', 'چنچنه'),
+    ('چوگیاه', 'حافظیه'),
+    ('حجت آباد', 'حسن آباد'),
+    ('حومه شیراز', 'خلدبرین'),
+    ('خلیلی', 'دارالرحمه'),
+    ('داریون', 'دانشکده دامپزشکی شیراز'),
+    ('دانشکده کشاورزی دانشگاه شیراز', 'دانشکده موشکی امام صادق (ع)'),
+    ('دانشگاه شیراز', 'دباغ خانه'),
+    ('درکی', 'دروازه اصفهان'),
+    ('دروازه قران', 'دست خضر'),
+    ('دشت چنار', 'دکتر حسابی'),
+    ('دلجو', 'دلگشا'),
+    ('ده پیاله', 'دودمان'),
+    ('دوکوهک', 'دینکان'),
+    ('رازی', 'راهنمایی'),
+    ('رحمت\u200cآباد', 'رکن\u200cآباد'),
+    ('ریاستی', 'ریشمک'),
+    ('زرگری', 'زرهی'),
+    ('زند', 'زیباشهر'),
+    ('سایت اداری', 'ستارخان'),
+    ('سجادیه', 'سرو'),
+    ('سعدیه جنوبی', 'سعدیه شمالی'),
+    ('سفیرشمالی', 'سلطان آباد'),
+    ('سهل\u200cآباد', 'سیاه سنگ'),
+    ('سیلو', 'سینما سعدی'),
+    ('شاپورجان', 'شاهجیان'),
+    ('شاهچراغ', 'شاه قلی بیگی'),
+    ('شریف\u200cآباد', 'شهدای شهرک سعدی'),
+    ('شهرک آرین', 'شهرک استقلال'),
+    ('شهرک امام حسن', 'شهرک امام حسین'),
+    ('شهرک امیر کبیر', 'شهرک ایثار'),
+    ('شهرک برف فروشان', 'شهرک برق'),
+    ('شهرک بزین', 'شهرک بهار'),
+    ('شهرک بهشتی', 'شهرک پردیس'),
+    ('شهرک پرواز', 'شهرک ترکان'),
+    ('شهرک جماران', 'شهرک دارایی'),
+    ('شهرک رضوان', 'شهرک زینبیه'),
+    ('شهرک سراج', 'شهرک سعدی'),
+    ('شهرک صادقیه', 'شهرک صدا و سیما'),
+    ('شهرک صنعتی', 'شهرک صنعتی شیراز'),
+    ('شهرک عرفان', 'شهرک فجر'),
+    ('شهرک فرزانگان', 'شهرک فرهنگیان'),
+    ('شهرک قمشه', 'شهرک کوثر'),
+    ('شهرک کوشکک', 'شهرک گلدشت حافظ'),
+    ('شهرک گلدشت محمدی', 'شهرک گلستان'),
+    ('شهرک گلستان شمالی', 'شهرک گلشن'),
+    ('شهرک گلها', 'شهرک مخابرات'),
+    ('شهرک مدرس', 'شهرک مطهری'),
+    ('شهرک مفتح', 'شهرک مهدی\u200cآباد'),
+    ('شهرک مهدیه', 'شهرک مهرگان'),
+    ('شهرک نفت ۲', 'شهرک نیایش'),
+    ('شهرک نیروی انتظامی', 'شهرک والفجر'),
+    ('شهرک ولیعصر', 'شهرک ویلایی بهاران'),
+    ('شهرک یاس طلاییه', 'شیخ روزبهان'),
+    ('شیخ علی چوپان', 'شیشه\u200cگری'),
+    ('شیمی گیاه', 'صاحب الزمان'),
+    ('صدا و سیما', 'صنایع الکترونیک'),
+    ('طلاب', 'ظفرآباد'),
+    ('عادل آباد', 'عفیف\u200cآباد'),
+    ('علوم پزشکی', 'علی آباد'),
+    ('غدیر جنوبی', 'غدیر شمالی'),
+    ('فاضل', 'فخرآباد (دروازه کازرون)'),
+    ('فرگاز', 'فرهنگ شهر'),
+    ('فرهنگیان', 'فرودگاه شهید دستغیب شیراز'),
+    ('فضل\u200cآباد', 'فلکه گاز'),
+    ('قالیشویی', 'قدوسی شرقی'),
+    ('قدوسی غربی', 'قصرالدشت'),
+    ('قلات', 'قلعه شاهزاده بیگم'),
+    ('قلعه نو', 'کاراندیش'),
+    ('کرونی(خاتونک)', 'کفترک'),
+    ('کلاهدوز', 'کودیان'),
+    ('کوزه گری', 'کوشک بیدک'),
+    ('کوشک میدان', 'کوهسار'),
+    ('کوهستان', 'کوی آزادگان'),
+    ('کوی زهرا', 'کوی فرهنگیان'),
+    ('کوی قضات', 'کوی وحدت'),
+    ('کیان آباد', 'کیان شهر'),
+    ('گچی', 'گلدشت معالی\u200cآباد'),
+    ('گلستان', 'گل سرخ'),
+    ('گلشن', 'گلکوب'),
+    ('گود خزینه', 'گود عربان'),
+    ('گویم', 'لاله'),
+    ('لب آب', 'لشکری'),
+    ('ماه فیروزان', 'مبعث'),
+    ('مجتمع شهید پرویزی', 'محراب'),
+    ('محمدیه', 'محمودآباد'),
+    ('محمودیه', 'مسکن مهر شیراز'),
+    ('مسلم', 'معالی\u200cآباد'),
+    ('ملاصدرا', 'منصورآباد'),
+    ('منطقه هوایی شهید دوران', 'منطقه ویژه اقتصادی'),
+    ('مهدی\u200cآباد', 'میانرود'),
+    ('میدان قائم', 'میرزاکوچک خان'),
+    ('نارنجستان', 'نجم آباد'),
+    ('نشاط', 'نصر'),
+    ('نصرآباد', 'نیایش'),
+    ('نیستان', 'هفت تنان'),
+    ('وحدت', 'وزیرآباد'),
+    ('وصال', 'ویلاشهر'),
+    ('یخ سازی',),
+)
+# Match Divar labels to published maps and district descriptions.
+# OpenStreetMap district maps: https://www.topomap.ir/?l=osm&r=6556143
+# Supplementary descriptions: https://shiraz.kadol.ir/manateq/
+SHIRAZ_DISTRICT_NAMES = dict(zip(SHIRAZ_DISTRICTS, (
+    'ابیوردی|ارم|تپه تلویزیون|جمهوری|چنچنه|چوگیاه|خلدبرین|رحمت\u200cآباد|زرگری|سینما سعدی|عفیف\u200cآباد|قدوسی غربی|قصرالدشت|ملاصدرا|فلکه گاز|نشاط|تلخ داش|ستارخان'.split("|"),
+    'تحویلی|فخرآباد (دروازه کازرون)|دشت چنار|محراب|رازی|زند|دباغ خانه|شهرک بهار|شهرک مفتح|شیخ علی چوپان|شیشه\u200cگری|فرودگاه شهید دستغیب شیراز|فضل\u200cآباد|قلعه شاهزاده بیگم|کوزه گری|کوی زهرا|گلکوب|منطقه هوایی شهید دوران|وصال'.split("|"),
+    'آبزنگی|باباکوهی|باغ تخت|حافظیه|دروازه اصفهان|دروازه قران|راهنمایی|سعدیه جنوبی|سعدیه شمالی|شهدای شهرک سعدی|شهرک سعدی|هفت تنان|نیستان'.split("|"),
+    'آبیاری|اصلاح\u200cنژاد|شهرک جماران|شهرک مهدیه|ترمینال باربری|درکی|ریشمک|زرهی|شهرک سراج|سفیرشمالی|شهرک ایثار|شهرک گلشن|شهرک مخابرات|فرگاز|فرهنگیان|قالیشویی|کلاهدوز|مبعث'.split("|"),
+    'احمدی جنوبی|پانصد دستگاه ارتش|دارالرحمه|شهرک گلها|شهرک مطهری|عادل آباد|کوشک میدان|مسلم|ده پیاله'.split("|"),
+    'تاچارا|جوادیه|دینکان|منصورآباد|فرهنگ شهر|کوی وحدت|گلدشت معالی\u200cآباد|معالی\u200cآباد'.split("|"),
+    'فاضل|شهرک ترکان|قلعه نو|دست خضر|نصرآباد|سهل\u200cآباد|شریف\u200cآباد|شهرک امام حسین|شهرک کوشکک|گل سرخ|وزیرآباد|کفترک'.split("|"),
+    'سیاه سنگ|شاهچراغ|گود عربان|بازار|بالا کفت|لب آب'.split("|"),
+    'احمدآباد|بهارستان|پشم شیشه|حجت آباد|سجادیه|محمدیه|شهرک برق|شهرک دارایی|شهرک رضوان|شهرک فرهنگیان|شهرک مدرس|شهرک مهدی\u200cآباد|شهرک والفجر|شیخ روزبهان|میانرود|شهرک فرزانگان'.split("|"),
+    'شهرک آرین|شهرک گلستان|شهرک بهشتی|شهرک بزین|شهرک گلدشت حافظ|گویم|دوکوهک|شهرک قمشه|شهرک عرفان'.split("|"),
+    'آزادگان|ریاستی|شهرک پرواز|پودنک|شهرک صدا و سیما|شهرک نیروی انتظامی|طلاب|کیان شهر|نصر'.split("|"),
+)))
+SHIRAZ_ASSIGNED_NAMES = {
+    name for names in SHIRAZ_DISTRICT_NAMES.values() for name in names
+}
+SHIRAZ_DISTRICT_NAMES[OTHER_SHIRAZ_NEIGHBORHOODS] = [
+    name for row in SHIRAZ_ROWS for name in row if name not in SHIRAZ_ASSIGNED_NAMES
+]
+SHIRAZ_DISTRICT_ROWS = {
+    district: tuple(tuple(names[i:i + 2]) for i in range(0, len(names), 2))
+    for district, names in SHIRAZ_DISTRICT_NAMES.items()
+}
 NEIGHBORHOOD_ROWS = {
+    SHIRAZ: SHIRAZ_ROWS,
     PHASE_ONE: PHASE_ONE_ROWS,
     PHASE_TWO: (
         ("115 هکتاری", "26 هکتاری"),
@@ -114,7 +277,7 @@ PUBLIC_NEIGHBORHOOD_AREAS = {
     for region, rows in NEIGHBORHOOD_ROWS.items()
     for row in rows
     for name in row
-}
+} | {f"{SHIRAZ}، {district}" for district in SHIRAZ_DISTRICTS}
 DEALS = ("فروش", "رهن و اجاره", "پیش‌فروش")
 TYPES = ("آپارتمان", "زمین", "مغازه", "ویلا", "اداری", "سایر")
 STATUS = {"draft": "در انتظار بررسی", "scheduled": "زمان‌بندی‌شده",
@@ -138,18 +301,62 @@ async def ask_region(message):
 
 async def registration_area(message, state):
     text = (message.text or "").strip()
-    region = (await state.get_data()).get("selected_region")
-    if text in REGIONS:
-        await state.update_data(selected_region=text)
-        rows = NEIGHBORHOOD_ROWS.get(text, ())
+    data = await state.get_data()
+    region = data.get("selected_region")
+    district = data.get("selected_district")
+    page = data.get("neighborhood_page", 0)
+    navigation = (PREVIOUS_NEIGHBORHOODS, NEXT_NEIGHBORHOODS)
+
+    if text == SHIRAZ or (region == SHIRAZ and text == BACK_TO_DISTRICTS):
+        await state.update_data(selected_region=SHIRAZ, selected_district=None, neighborhood_page=0)
+        district_buttons = SHIRAZ_DISTRICTS + (OTHER_SHIRAZ_NEIGHBORHOODS,)
+        rows = tuple(district_buttons[i:i + 2] for i in range(0, len(district_buttons), 2))
         await message.answer(
-            with_voice_option("محله را انتخاب کنید یا نام آن را بنویسید."),
+            with_voice_option("منطقهٔ شیراز را انتخاب کنید یا نام محله را بنویسید."),
             reply_markup=keyboard(*rows, (SKIP_NEIGHBORHOOD, MENU)),
         )
         return None
-    if region and text:
-        return region if text == SKIP_NEIGHBORHOOD else f"{region}، {text}"
-    return text
+
+    if text in REGIONS:
+        region, district, page = text, None, 0
+    elif region == SHIRAZ and text in SHIRAZ_DISTRICT_ROWS:
+        district, page = text, 0
+    elif region == SHIRAZ and district and text in navigation:
+        rows = SHIRAZ_DISTRICT_ROWS[district]
+        last_page = (len(rows) - 1) // SHIRAZ_ROWS_PER_PAGE
+        step = 1 if text == NEXT_NEIGHBORHOODS else -1
+        page = min(last_page, max(0, page + step))
+    elif region and text:
+        if text == SKIP_NEIGHBORHOOD:
+            if district in SHIRAZ_DISTRICTS:
+                return f"{SHIRAZ}، {district}"
+            return region
+        return f"{region}، {text}"
+    else:
+        return text
+
+    await state.update_data(selected_region=region, selected_district=district, neighborhood_page=page)
+    rows = SHIRAZ_DISTRICT_ROWS[district] if district else NEIGHBORHOOD_ROWS[region]
+    prompt = "محله را انتخاب کنید یا نام آن را بنویسید."
+    if district:
+        prompt = f"{district}\n{prompt}"
+        start = page * SHIRAZ_ROWS_PER_PAGE
+        end = start + SHIRAZ_ROWS_PER_PAGE
+        total_pages = (len(rows) + SHIRAZ_ROWS_PER_PAGE - 1) // SHIRAZ_ROWS_PER_PAGE
+        controls = tuple(
+            label for label, visible in zip(navigation, (page > 0, end < len(rows)))
+            if visible
+        )
+        rows = rows[start:end]
+        if controls:
+            rows += (controls,)
+            prompt += f" (صفحهٔ {page + 1} از {total_pages})"
+        rows += ((BACK_TO_DISTRICTS,),)
+    await message.answer(
+        with_voice_option(prompt),
+        reply_markup=keyboard(*rows, (SKIP_NEIGHBORHOOD, MENU)),
+    )
+    return None
 
 
 def main_menu(user_id):
