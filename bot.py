@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import binascii
 import hmac
 import json
 import logging
@@ -20,7 +22,7 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import SimpleEventIsolation
-from aiogram.types import (BotCommand, BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+from aiogram.types import (BotCommand, BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters,
                            KeyboardButton, Message, ReplyKeyboardMarkup)
 from aiogram.fsm.strategy import FSMStrategy
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -430,6 +432,10 @@ class OfficeVisit(StatesGroup):
 scheduler = AsyncIOScheduler(timezone=TZ)
 
 
+SKIP_PROPERTY_PHOTO = "بدون عکس ادامه بده"
+MAX_PROPERTY_PHOTO = 1_500_000
+
+
 class AddProperty(StatesGroup):
     deal_type = State()
     property_type = State()
@@ -438,6 +444,7 @@ class AddProperty(StatesGroup):
     price = State()
     details = State()
     phone = State()
+    photo = State()
 
 
 def is_admin(user_id: int) -> bool:
@@ -522,6 +529,11 @@ async def init_db():
         for column in ("latitude", "longitude"):
             if column not in columns:
                 await db.execute(f"ALTER TABLE properties ADD COLUMN {column} REAL")
+        if "photo_file_id" not in columns:
+            await db.execute("ALTER TABLE properties ADD COLUMN photo_file_id TEXT")
+        if "web_request_id" not in columns:
+            await db.execute("ALTER TABLE properties ADD COLUMN web_request_id TEXT")
+        await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS properties_web_request_id ON properties(web_request_id)")
         await db.commit()
 
 
@@ -620,6 +632,8 @@ async def publish_property(bot: Bot, property_id: int, *, due_at=None):
                 "UPDATE properties SET status='published', scheduled_at=NULL WHERE id=?",
                 (property_id,),
             )
+            if row["web_request_id"]:
+                await db.execute("INSERT OR IGNORE INTO listing_group_posts (property_id) VALUES (?)", (property_id,))
             await db.commit()
         return True
 
@@ -743,7 +757,7 @@ def public_lines(row):
 
 
 async def inventory(filters, before=None, limit=None):
-    sql = """SELECT id, deal_type, property_type, area, size_m2, price_toman
+    sql = """SELECT id, deal_type, property_type, area, size_m2, price_toman, photo_file_id
              FROM properties WHERE status='published'"""
     args = []
     for key in ("deal_type", "property_type", "area"):
@@ -765,10 +779,29 @@ async def inventory(filters, before=None, limit=None):
         return await (await db.execute(sql, args)).fetchall()
 
 
+async def answer_property_card(message, row, markup):
+    caption = "\n".join(public_lines(row))
+    if row["photo_file_id"]:
+        try:
+            await message.answer_photo(row["photo_file_id"], caption=caption, reply_markup=markup)
+            return
+        except TelegramAPIError:
+            logging.warning("Property photo was unavailable for listing %s", row["id"])
+    await message.answer(caption, reply_markup=markup)
+
+
 async def catalog_page(message, before=None):
     rows = await inventory({}, before, 6)
     if not rows:
         await message.answer("فعلاً ملک تأییدشده‌ای در این صفحه موجود نیست.")
+        return
+    if any(row["photo_file_id"] for row in rows[:5]):
+        for row in rows[:5]:
+            button = InlineKeyboardButton(text=f"بازدید ملک {row['id']}", callback_data=f"visit:{row['id']}")
+            await answer_property_card(message, row, InlineKeyboardMarkup(inline_keyboard=[[button]]))
+        if len(rows) > 5:
+            button = InlineKeyboardButton(text="ملک‌های بعدی", callback_data=f"catalog:{rows[4]['id']}")
+            await message.answer("صفحهٔ بعدی فهرست", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[button]]))
         return
     cards = ["\n".join(public_lines(row)) for row in rows[:5]]
     buttons = [[InlineKeyboardButton(text=f"بازدید ملک {r['id']}", callback_data=f"visit:{r['id']}")] for r in rows[:5]]
@@ -1266,23 +1299,34 @@ async def add_details(message: Message, state: FSMContext):
 @dp.message(AddProperty.phone, F.contact)
 @dp.message(AddProperty.phone, F.text, ~F.text.startswith("/"))
 async def add_phone(message: Message, state: FSMContext):
-    data = await state.get_data()
     phone = lead_phone_number(message)
     if not phone:
         await message.answer("شماره موبایل را با 09 یا +98 وارد کنید.")
         return
+    await state.update_data(phone=phone)
+    await state.set_state(AddProperty.photo)
+    await message.answer("یک عکس از ملک بفرستید یا بدون عکس ادامه دهید.",
+                         reply_markup=keyboard((SKIP_PROPERTY_PHOTO,), (MENU,)))
+
+
+@dp.message(AddProperty.photo, F.photo, (F.caption.is_(None) | ~F.caption.regexp(r"^/photo(?:@[A-Za-z0-9_]+)?\s")))
+@dp.message(AddProperty.photo, F.text == SKIP_PROPERTY_PHOTO)
+async def add_property_photo(message: Message, state: FSMContext):
+    data = await state.get_data()
+    phone = data["phone"]
+    photo_id = message.photo[-1].file_id if message.photo else None
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             """INSERT INTO properties
             (owner_user_id, deal_type, property_type, area, size_m2, price_toman,
-             details, phone, status, created_at, latitude, longitude)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)""",
+             details, phone, status, created_at, latitude, longitude, photo_file_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?)""",
             (
                 message.from_user.id, data["deal_type"], data["property_type"],
                 data["area"], data["size_m2"] or None, data["price_toman"] or None,
                 (("دفتر همکار | " if data.get("agency") else "") + data["details"]), phone,
                 datetime.now(TZ).isoformat(timespec="minutes"),
-                data.get("latitude"), data.get("longitude"),
+                data.get("latitude"), data.get("longitude"), photo_id,
             )
         )
         property_id = cur.lastrowid
@@ -1293,6 +1337,11 @@ async def add_phone(message: Message, state: FSMContext):
         f"ملک شماره {property_id} ثبت شد و در انتظار بررسی دفتر است.",
         reply_markup=main_menu(message.from_user.id)
     )
+    if photo_id:
+        try:
+            await message.bot.send_photo(int(OWNER_ID), photo_id, caption=f"عکس ملک شمارهٔ {property_id}")
+        except TelegramAPIError:
+            logging.warning("New property photo notification failed for listing %s", property_id)
     await notify_owner(
         message.bot,
         ("🏢 دفتر همکار\n" if data.get("agency") else "") + f"🏠 ملک جدید شماره {property_id}\n"
@@ -1303,6 +1352,20 @@ async def add_phone(message: Message, state: FSMContext):
         f"توضیحات: {data['details']}\nشماره فروشنده: {phone}",
         reply_button("seller", property_id),
     )
+
+
+@dp.message(F.photo, F.caption.regexp(r"^/photo(?:@[A-Za-z0-9_]+)? [0-9]{1,15}$"))
+async def replace_property_photo(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    property_id = int(message.caption.split()[-1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "UPDATE properties SET photo_file_id=? WHERE id=? AND status IN ('draft','reviewed','scheduled','published')",
+            (message.photo[-1].file_id, property_id),
+        )
+        await db.commit()
+    await message.answer("عکس ملک ثبت شد." if cur.rowcount else "ملک قابل ویرایش پیدا نشد.")
 
 
 async def extract_search_filters(query: str) -> dict:
@@ -1389,10 +1452,7 @@ async def show_results(message: Message, filters: dict):
     await message.answer("جدیدترین ملک‌های مطابق جست‌وجو", reply_markup=main_menu(message.from_user.id))
     for row in rows:
         button = InlineKeyboardButton(text="درخواست بازدید", callback_data=f"visit:{row['id']}")
-        await message.answer(
-            "\n".join(public_lines(row)),
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[button]]),
-        )
+        await answer_property_card(message, row, InlineKeyboardMarkup(inline_keyboard=[[button]]))
 
 
 @dp.message(Command("lead"))
@@ -1487,9 +1547,14 @@ async def pending(message: Message):
         await message.answer("آگهی پیش‌نویس نداریم.")
         return
     for row in rows:
+        if row["photo_file_id"]:
+            try:
+                await message.answer_photo(row["photo_file_id"], caption=f"عکس ملک شمارهٔ {row['id']}")
+            except TelegramAPIError:
+                logging.warning("Review photo unavailable for listing %s", row["id"])
         await message.answer(
             property_text(row, admin=True) + f"\nوضعیت: {STATUS[row['status']]}",
-            parse_mode="HTML", reply_markup=reply_button("seller", row["id"]),
+            parse_mode="HTML", reply_markup=reply_button("seller", row["id"]) if row["owner_user_id"] else web_property_actions(row["id"]),
         )
 
 
@@ -1506,8 +1571,13 @@ async def moderate_property(query: CallbackQuery):
         changed = await reject_property(property_id)
     await query.answer("وضعیت آگهی به‌روزرسانی شد." if changed else "وضعیت آگهی تغییر نکرد.", show_alert=True)
     if changed:
-        await query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="ارسال پاسخ", callback_data=f"ownerreply:seller:{property_id}")]]))
+        row = await get_property(property_id)
+        markup = None
+        if row and row["owner_user_id"]:
+            markup = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="ارسال پاسخ", callback_data=f"ownerreply:seller:{property_id}")
+            ]])
+        await query.message.edit_reply_markup(reply_markup=markup)
 
 
 @dp.message(Command("publish"))
@@ -1814,6 +1884,13 @@ async def unknown_message(message: Message):
     await message.answer("برای ادامه یکی از گزینه‌ها را انتخاب کنید.", reply_markup=main_menu(message.from_user.id))
 
 
+def web_property_actions(property_id):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="تأیید آگهی", callback_data=f"approve:{property_id}"),
+        InlineKeyboardButton(text="رد", callback_data=f"reject:{property_id}"),
+    ]])
+
+
 def web_application(bot, secret):
     @web.middleware
     async def authenticate(request, handler):
@@ -1832,9 +1909,22 @@ def web_application(bot, secret):
                 "id": row["id"], "area": area or "محدوده با هماهنگی دفتر",
                 "deal": row["deal_type"] if row["deal_type"] in DEALS else "",
                 "kind": row["property_type"] if row["property_type"] in TYPES else "سایر",
-                "size": row["size_m2"], "price": row["price_toman"],
+                "size": row["size_m2"], "price": row["price_toman"], "hasPhoto": bool(row["photo_file_id"]),
             })
         return web.json_response({"listings": result})
+
+    async def photo(request):
+        row = await get_property(int(request.match_info["id"]))
+        if not row or row["status"] != "published" or not row["photo_file_id"]:
+            raise web.HTTPNotFound()
+        try:
+            image = await bot.download(row["photo_file_id"], timeout=10)
+        except TelegramAPIError:
+            raise web.HTTPNotFound()
+        if not image or not image.getvalue().startswith(b"\xff\xd8\xff"):
+            raise web.HTTPNotFound()
+        return web.Response(body=image.getvalue(), content_type="image/jpeg",
+                            headers={"X-Content-Type-Options": "nosniff"})
 
     async def submit(request):
         try:
@@ -1860,7 +1950,9 @@ def web_application(bot, secret):
                 or any(not re.fullmatch(r"[1-9][0-9]*", fields[key]) for key in ("size", "price"))):
             raise web.HTTPBadRequest()
         area = "، ".join(fields[key] for key in ("city", "district", "neighborhood") if fields[key])
-        label = "درخواست خرید" if mode == "buy" else "پیشنهاد فروش"
+        if mode == "sell":
+            return await submit_listing(data, fields, phone, area)
+        label = "درخواست خرید"
         description = (
             f"سایت SLD | {label}\n{fields['kind']} | {area}\n"
             f"متراژ: {fields['size']} متر مربع | مبلغ: {int(fields['price']):,} تومان\n"
@@ -1883,8 +1975,64 @@ def web_application(bot, secret):
         logging.info("Website request %s saved in bot inbox", lead_id)
         return web.json_response({"id": lead_id}, status=201)
 
-    app = web.Application(middlewares=[authenticate], client_max_size=8192)
+    async def submit_listing(data, fields, phone, area):
+        request_id = fields["requestId"]
+        deal = data.get("deal", DEALS[0])
+        encoded = data.get("photo", "")
+        if (deal not in DEALS or not isinstance(encoded, str) or len(encoded) > 2_000_000
+                or int(fields["size"]) > 100_000 or int(fields["price"]) > 999_999_999_999_999):
+            raise web.HTTPBadRequest()
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT id FROM properties WHERE web_request_id=?", (request_id,)) as cur:
+                existing = await cur.fetchone()
+        if existing:
+            return web.json_response({"id": existing[0]})
+        photo_id = None
+        if encoded:
+            try:
+                payload = base64.b64decode(encoded, validate=True)
+            except (ValueError, binascii.Error):
+                raise web.HTTPBadRequest()
+            if len(payload) > MAX_PROPERTY_PHOTO or not payload.startswith(b"\xff\xd8\xff"):
+                raise web.HTTPBadRequest()
+            try:
+                uploaded = await bot.send_photo(int(OWNER_ID), BufferedInputFile(payload, "property.jpg"),
+                                                caption="عکس آگهی ارسالی از سایت SLD")
+            except TelegramAPIError:
+                raise web.HTTPBadRequest()
+            photo_id = uploaded.photo[-1].file_id
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                """INSERT INTO properties
+                (owner_user_id, deal_type, property_type, area, size_m2, price_toman, details,
+                 phone, status, created_at, photo_file_id, web_request_id)
+                VALUES (0, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)
+                ON CONFLICT(web_request_id) DO NOTHING""",
+                (deal, fields["kind"], area, int(fields["size"]), int(fields["price"]),
+                 fields["details"].strip(), phone, datetime.now(TZ).isoformat(timespec="minutes"),
+                 photo_id, request_id),
+            )
+            created = cur.rowcount > 0
+            async with db.execute("SELECT id FROM properties WHERE web_request_id=?", (request_id,)) as cur:
+                listing_id = (await cur.fetchone())[0]
+            await db.commit()
+        if created:
+            reply = {"reply_parameters": ReplyParameters(message_id=uploaded.message_id, allow_sending_without_reply=True)} if photo_id else {}
+            try:
+                await bot.send_message(
+                    int(OWNER_ID), f"🏠 آگهی سایت SLD شمارهٔ {listing_id} | منتظر بررسی\n"
+                    f"{deal} | {fields['kind']} | {area}\n"
+                    f"متراژ: {fields['size']} متر مربع | مبلغ: {int(fields['price']):,} تومان\n"
+                    f"{fields['details']}\nشماره تماس: {phone}",
+                    reply_markup=web_property_actions(listing_id), **reply,
+                )
+            except TelegramAPIError:
+                logging.warning("Website listing %s awaits review in the bot", listing_id)
+        return web.json_response({"id": listing_id}, status=201 if created else 200)
+
+    app = web.Application(middlewares=[authenticate], client_max_size=2_010_000)
     app.router.add_get("/catalog", catalog)
+    app.router.add_get(r"/photos/{id:[0-9]{1,15}}", photo)
     app.router.add_post("/requests", submit)
     return app
 
