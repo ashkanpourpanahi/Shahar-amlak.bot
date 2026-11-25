@@ -78,6 +78,8 @@ VISIT_SOURCES = ("حضوری", "تلفنی")
 VISIT_STATUSES = ("در انتظار پیگیری", "پیگیری شد")
 MENU = "↩️ منوی اصلی"
 ANY = "همه موارد"
+PICK_MAP = "📍 انتخاب روی نقشه"
+MAP_AREA = "موقعیت ثبت شده نزد دفتر"
 PHASE_ONE = "صدرا فاز ۱"
 PHASE_TWO = "صدرا فاز ۲"
 SHIRAZ = "شیراز"
@@ -295,12 +297,18 @@ def keyboard(*rows):
 async def ask_region(message):
     await message.answer(
         with_voice_option("محدودهٔ ملک را انتخاب کنید یا شهر و محله را بنویسید."),
-        reply_markup=keyboard(REGIONS[:1], REGIONS[1:], (MENU,)),
+        reply_markup=keyboard((REGIONS[0], PICK_MAP), REGIONS[1:], (MENU,)),
     )
 
 
 async def registration_area(message, state):
     text = (message.text or "").strip()
+    if text == PICK_MAP:
+        await message.answer(
+            "از گیرهٔ 📎 کنار پیام، «موقعیت مکانی» را باز کنید. "
+            "پین را روی ملک یا محدودهٔ دلخواه بگذارید و موقعیت انتخاب‌شده را بفرستید."
+        )
+        return None
     data = await state.get_data()
     region = data.get("selected_region")
     district = data.get("selected_district")
@@ -357,6 +365,27 @@ async def registration_area(message, state):
         reply_markup=keyboard(*rows, (SKIP_NEIGHBORHOOD, MENU)),
     )
     return None
+
+
+def map_line(latitude, longitude):
+    if latitude is None or longitude is None:
+        return ""
+    return f"📍 نقشه: https://www.google.com/maps?q={latitude:.6f},{longitude:.6f}\n"
+
+
+async def ask_registration_size(message, state, area, *, latitude=None, longitude=None):
+    buyer = await state.get_state() == BuyerRequest.area.state
+    await state.update_data(area=area, latitude=latitude, longitude=longitude)
+    await state.set_state(BuyerRequest.size if buyer else AddProperty.size)
+    prompt = (
+        "متراژ دلخواه را به متر مربع وارد کنید. اگر فرقی ندارد، صفر بفرستید."
+        if buyer else "متراژ را به عدد وارد کن. اگر مشخص نیست، 0 بنویس."
+    )
+    if latitude is not None:
+        prompt = "📍 موقعیت روی نقشه دریافت شد.\n" + prompt
+    await message.answer(prompt, reply_markup=keyboard((MENU,)))
+
+
 
 
 def main_menu(user_id):
@@ -485,6 +514,13 @@ async def init_db():
                 await db.execute("ALTER TABLE properties ADD COLUMN catalog_version INTEGER DEFAULT 1")
                 await db.execute("UPDATE properties SET status='draft', scheduled_at=NULL WHERE status IN ('published','scheduled')")
         await db.commit()
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("PRAGMA table_info(properties)") as cursor:
+            columns = {row[1] for row in await cursor.fetchall()}
+        for column in ("latitude", "longitude"):
+            if column not in columns:
+                await db.execute(f"ALTER TABLE properties ADD COLUMN {column} REAL")
+        await db.commit()
 
 
 def toman_number(text: str):
@@ -549,11 +585,13 @@ async def notify_owner(bot, text, markup):
 
 def property_text(row, *, admin=False):
     phone = row["phone"] if admin else None
+    location = map_line(row["latitude"], row["longitude"]) if admin else ""
     return (
         f"🏠 <b>آگهی شماره {row['id']}</b>\n"
         f"معامله: {escape(row['deal_type'])}\n"
         f"ملک: {escape(row['property_type'])}\n"
         f"منطقه: {escape(row['area'])}\n"
+        f"{escape(location)}"
         f"متراژ: {row['size_m2'] or 'ثبت نشده'} متر\n"
         f"{'رهن / مبلغ ثبت‌شده' if row['deal_type'] == 'رهن و اجاره' else 'قیمت'}: {format_price(row['price_toman'])}\n"
         f"توضیحات: {escape(row['details'] or 'ندارد')}\n"
@@ -837,6 +875,21 @@ async def lead_property_type(message: Message, state: FSMContext):
     await ask_region(message)
 
 
+@dp.message(BuyerRequest.area, F.location)
+@dp.message(AddProperty.area, F.location)
+async def registration_location(message: Message, state: FSMContext):
+    location = message.location
+    if location.live_period or not (
+        -90 <= location.latitude <= 90 and -180 <= location.longitude <= 180
+    ):
+        await message.answer("یک پین ثابت از روی نقشه بفرستید.")
+        return
+    await ask_registration_size(
+        message, state, MAP_AREA,
+        latitude=location.latitude, longitude=location.longitude,
+    )
+
+
 @dp.message(BuyerRequest.area, F.text, ~F.text.startswith("/"))
 async def lead_area(message: Message, state: FSMContext):
     area = await registration_area(message, state)
@@ -845,9 +898,7 @@ async def lead_area(message: Message, state: FSMContext):
     if not 0 < len(area) <= 120:
         await message.answer("شهر و محله را در حداکثر ۱۲۰ نویسه بنویسید.")
         return
-    await state.update_data(area=area)
-    await state.set_state(BuyerRequest.size)
-    await message.answer("متراژ دلخواه را به متر مربع وارد کنید. اگر فرقی ندارد، صفر بفرستید.", reply_markup=keyboard((MENU,)))
+    await ask_registration_size(message, state, area)
 
 
 @dp.message(BuyerRequest.size, F.text, ~F.text.startswith("/"))
@@ -876,6 +927,7 @@ async def lead_budget(message: Message, state: FSMContext):
     request = (
         f"{data['deal']} | {data['property_type']}\n"
         f"شهر و محله: {data['area']}\n"
+        f"{map_line(data.get('latitude'), data.get('longitude'))}"
         f"متراژ: {size}\n"
         f"{amount}: {budget_text}"
     )
@@ -1170,9 +1222,7 @@ async def add_area(message: Message, state: FSMContext):
     if not area:
         await message.answer("نام محله و شهر را به صورت متن بفرستید.")
         return
-    await state.update_data(area=area[:120])
-    await state.set_state(AddProperty.size)
-    await message.answer("متراژ را به عدد وارد کن. اگر مشخص نیست، 0 بنویس.", reply_markup=keyboard((MENU,)))
+    await ask_registration_size(message, state, area[:120])
 
 
 @dp.message(AddProperty.size, ~F.text.startswith("/"))
@@ -1223,13 +1273,14 @@ async def add_phone(message: Message, state: FSMContext):
         cur = await db.execute(
             """INSERT INTO properties
             (owner_user_id, deal_type, property_type, area, size_m2, price_toman,
-             details, phone, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?)""",
+             details, phone, status, created_at, latitude, longitude)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)""",
             (
                 message.from_user.id, data["deal_type"], data["property_type"],
                 data["area"], data["size_m2"] or None, data["price_toman"] or None,
                 (("دفتر همکار | " if data.get("agency") else "") + data["details"]), phone,
-                datetime.now(TZ).isoformat(timespec="minutes")
+                datetime.now(TZ).isoformat(timespec="minutes"),
+                data.get("latitude"), data.get("longitude"),
             )
         )
         property_id = cur.lastrowid
@@ -1244,6 +1295,7 @@ async def add_phone(message: Message, state: FSMContext):
         message.bot,
         ("🏢 دفتر همکار\n" if data.get("agency") else "") + f"🏠 ملک جدید شماره {property_id}\n"
         f"{data['deal_type']} | {data['property_type']} | {data['area']}\n"
+        f"{map_line(data.get('latitude'), data.get('longitude'))}"
         f"متراژ: {data['size_m2'] or 'ثبت نشده'}\n"
         f"مبلغ: {format_price(data['price_toman'])}\n"
         f"توضیحات: {data['details']}\nشماره فروشنده: {phone}",
