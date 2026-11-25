@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 import aiosqlite
 import arabic_reshaper
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandObject, CommandStart
@@ -1671,8 +1673,8 @@ async def admin_leads(message: Message):
         status = "پاسخ ارسال شد" if row["replied_at"] else "در انتظار بررسی"
         await message.answer(
             f"درخواست {row['id']} | {status}\n{row['request_text']}\n"
-            f"شماره خریدار: {row['phone'] or 'در فیلد جداگانه ثبت نشده'}",
-            reply_markup=reply_button("buyer", row["id"]),
+            f"شماره تماس: {row['phone'] or 'در فیلد جداگانه ثبت نشده'}",
+            reply_markup=reply_button("buyer", row["id"]) if row["user_id"] else None,
         )
 
 
@@ -1812,11 +1814,89 @@ async def unknown_message(message: Message):
     await message.answer("برای ادامه یکی از گزینه‌ها را انتخاب کنید.", reply_markup=main_menu(message.from_user.id))
 
 
+def web_application(bot, secret):
+    @web.middleware
+    async def authenticate(request, handler):
+        if not hmac.compare_digest(request.headers.get("Authorization", "").encode(), b"Bearer " + secret.encode()):
+            raise web.HTTPUnauthorized()
+        return await handler(request)
+
+    async def catalog(request):
+        rows = await inventory({})
+        result = []
+        for row in rows:
+            area = row["area"].strip()
+            if area not in PUBLIC_NEIGHBORHOOD_AREAS and area not in REGIONS:
+                area = next((region for region in REGIONS if area.startswith(region + "،")), "")
+            result.append({
+                "id": row["id"], "area": area or "محدوده با هماهنگی دفتر",
+                "deal": row["deal_type"] if row["deal_type"] in DEALS else "",
+                "kind": row["property_type"] if row["property_type"] in TYPES else "سایر",
+                "size": row["size_m2"], "price": row["price_toman"],
+            })
+        return web.json_response({"listings": result})
+
+    async def submit(request):
+        try:
+            data = await request.json()
+        except (ValueError, UnicodeError):
+            raise web.HTTPBadRequest()
+        limits = {"mode": 4, "city": 24, "district": 40, "neighborhood": 80,
+                  "kind": 20, "size": 10, "price": 16, "details": 500,
+                  "phone": 24, "requestId": 36}
+        if not isinstance(data, dict):
+            raise web.HTTPBadRequest()
+        fields = {key: data.get(key, "") for key in limits}
+        if any(not isinstance(value, str) or len(value) > limits[key] for key, value in fields.items()):
+            raise web.HTTPBadRequest()
+        phone = fields["phone"].strip().translate(str.maketrans(
+            "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"
+        ))
+        mode = fields["mode"]
+        if (mode not in {"buy", "sell"} or fields["kind"] not in TYPES
+                or fields["city"] not in {"شیراز", "صدرا فاز ۱", "صدرا فاز ۲"}
+                or not re.fullmatch(r"09[0-9]{9}", phone)
+                or not re.fullmatch(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}", fields["requestId"])
+                or any(not re.fullmatch(r"[1-9][0-9]*", fields[key]) for key in ("size", "price"))):
+            raise web.HTTPBadRequest()
+        area = "، ".join(fields[key] for key in ("city", "district", "neighborhood") if fields[key])
+        label = "درخواست خرید" if mode == "buy" else "پیشنهاد فروش"
+        description = (
+            f"سایت SLD | {label}\n{fields['kind']} | {area}\n"
+            f"متراژ: {fields['size']} متر مربع | مبلغ: {int(fields['price']):,} تومان\n"
+            f"{fields['details'].strip()}"
+        ).rstrip()
+        source_id = "sld:" + fields["requestId"]
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute("SELECT id FROM leads WHERE user_id=0 AND username=?", (source_id,)) as cur:
+                existing = await cur.fetchone()
+            if existing:
+                return web.json_response({"id": existing[0]}, status=200)
+            cur = await db.execute(
+                "INSERT INTO leads (user_id, username, request_text, phone, created_at) VALUES (0, ?, ?, ?, ?)",
+                (source_id, description, phone, datetime.now(TZ).isoformat(timespec="minutes")),
+            )
+            lead_id = cur.lastrowid
+            await db.commit()
+        await notify_owner(bot, f"📩 درخواست سایت #{lead_id}\n{description}\nشماره تماس: {phone}", None)
+        logging.info("Website request %s saved in bot inbox", lead_id)
+        return web.json_response({"id": lead_id}, status=201)
+
+    app = web.Application(middlewares=[authenticate], client_max_size=8192)
+    app.router.add_get("/catalog", catalog)
+    app.router.add_post("/requests", submit)
+    return app
+
+
 async def main():
     if not OWNER_ID.isascii() or not OWNER_ID.isdecimal() or int(OWNER_ID) <= 0:
         raise RuntimeError("OWNER_ID یا ADMIN_IDS تک‌نفره را با شناسه عددی مدیر تنظیم کنید.")
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN در فایل .env تنظیم نشده است.")
+    web_secret = os.getenv("SLD_WEB_SECRET", "").strip()
+    if web_secret and (DB_PATH != "/data/amlak.db" or not Path(DB_PATH).is_file()):
+        raise RuntimeError("SLD website requires the existing /data/amlak.db database.")
     await init_db()
     bot = Bot(BOT_TOKEN)
     await bot.set_my_commands([
@@ -1829,9 +1909,16 @@ async def main():
                       id="sld_group_posts", max_instances=1)
     scheduler.start()
     logging.info("Shahr Amlak bot is running. Commit: %s", os.getenv("RAILWAY_GIT_COMMIT_SHA", "local"))
+    runner = None
     try:
+        if web_secret:
+            runner = web.AppRunner(web_application(bot, web_secret), access_log=None)
+            await runner.setup()
+            await web.TCPSite(runner, "0.0.0.0", 8080).start()
         await dp.start_polling(bot, handle_as_tasks=True)
     finally:
+        if runner:
+            await runner.cleanup()
         scheduler.shutdown(wait=False)
         await bot.session.close()
 
