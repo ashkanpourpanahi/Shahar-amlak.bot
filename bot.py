@@ -2030,7 +2030,103 @@ def web_application(bot, secret):
                 logging.warning("Website listing %s awaits review in the bot", listing_id)
         return web.json_response({"id": listing_id}, status=201 if created else 200)
 
+    async def assistant_status(request):
+        return web.json_response({"enabled": bool(os.getenv("OPENAI_API_KEY"))})
+
+    async def assistant(request):
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            return web.json_response({"error": "disabled"}, status=503)
+        if request.content_type != "application/json":
+            raise web.HTTPUnsupportedMediaType()
+        raw = bytearray()
+        async for chunk in request.content.iter_chunked(4096):
+            raw.extend(chunk)
+            if len(raw) > 20_000:
+                raise web.HTTPRequestEntityTooLarge(max_size=20_000, actual_size=len(raw))
+        try:
+            messages = json.loads(raw)["messages"]
+        except (ValueError, KeyError, TypeError):
+            raise web.HTTPBadRequest()
+        if not isinstance(messages, list) or len(messages) not in (1, 3, 5, 7):
+            raise web.HTTPBadRequest()
+        for index, message in enumerate(messages):
+            role = "assistant" if index % 2 else "user"
+            if (not isinstance(message, dict) or message.get("role") != role
+                    or not isinstance(message.get("content"), str)
+                    or not 0 < len(message["content"].strip()) <= (1600 if index % 2 else 700)):
+                raise web.HTTPBadRequest()
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "answer": {"type": "string"},
+                "search": {"type": "boolean"},
+                "deal": {"type": "string", "enum": list(DEALS)},
+                "kind": {"type": "string", "enum": ["", *TYPES]},
+                "city": {"type": "string", "enum": ["", *REGIONS]},
+                "neighborhood": {"type": "string"},
+                "budget": {"type": "integer"},
+            },
+            "required": ["answer", "search", "deal", "kind", "city", "neighborhood", "budget"],
+            "additionalProperties": False,
+        }
+        instructions = (
+            "You are SLD's Persian real-estate assistant for Shiraz and Sadra. "
+            "Answer concisely in Persian and only about property. Redirect unrelated questions. "
+            "Give general practical guidance and ask for missing details. "
+            "Do not request phone numbers, identity or deed numbers, or full addresses. "
+            "Do not assert current prices, legal conclusions or guarantees. Never invent listings. "
+            "Set search=true only when the visitor wants to find a property. Preserve relevant search criteria "
+            "from preceding turns and apply corrections. Use a bare neighborhood name with no filler text. "
+            "Budget is maximum total price in toman, or maximum deposit for rental. Use zero when unknown "
+            "or when the only figure is monthly rent. Default deal to فروش if the visitor doesn't specify. "
+            "The app searches the published catalog after your response. Never claim results before that search."
+        )
+        try:
+            async with AsyncOpenAI(api_key=api_key, max_retries=0, timeout=18.0) as client:
+                response = await client.responses.create(
+                    model="gpt-4.1-mini", instructions=instructions, store=False, max_output_tokens=650,
+                    input=[{"role": message["role"], "content": message["content"]} for message in messages],
+                    text={"format": {"type": "json_schema", "name": "sld_property_reply", "strict": True, "schema": schema}},
+                )
+            result = json.loads(response.output_text)
+            answer = result["answer"].strip()[:1600]
+            if not answer:
+                raise ValueError("empty assistant response")
+        except Exception as error:
+            logging.warning("SLD assistant model request failed (%s)", type(error).__name__)
+            return web.json_response({"error": "provider"}, status=502)
+
+        payload = {"answer": answer}
+        if result["search"]:
+            deal = result["deal"]
+            kind = result["kind"]
+            city = result["city"]
+            neighborhood = result["neighborhood"].strip()[:80]
+            budget = min(max(0, result["budget"]), 999_999_999_999_999)
+            public_catalog = json.loads((await catalog(request)).body)["listings"]
+            def normalized(value):
+                return " ".join(value.replace("ي", "ی").replace("ك", "ک").replace("\u200c", " ").split())
+            terms = normalized(neighborhood).split()
+            matches = [
+                item for item in public_catalog
+                if item["deal"] == deal and (not kind or item["kind"] == kind)
+                and (not city or item["area"].split("،")[0].strip() == city)
+                and all(term in normalized(item["area"]) for term in terms)
+                and (not budget or 0 < (item["price"] or 0) <= budget)
+            ]
+            payload["search"] = {
+                "filters": {"deal": dict(zip(DEALS, ("buy", "rent", "project")))[deal],
+                            "kind": kind, "city": city, "q": neighborhood, "budget": budget},
+                "count": len(matches),
+                "listings": matches[:4],
+            }
+        return web.json_response(payload)
+
     app = web.Application(middlewares=[authenticate], client_max_size=2_010_000)
+    app.router.add_get("/assistant", assistant_status)
+    app.router.add_post("/assistant", assistant)
     app.router.add_get("/catalog", catalog)
     app.router.add_get(r"/photos/{id:[0-9]{1,15}}", photo)
     app.router.add_post("/requests", submit)
