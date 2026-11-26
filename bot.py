@@ -417,6 +417,10 @@ class BuyerRequest(StatesGroup):
     phone = State()
 
 
+class WebsiteQuestion(StatesGroup):
+    text = State()
+
+
 class OwnerReply(StatesGroup):
     text = State()
 
@@ -724,6 +728,40 @@ async def inquire_group_listing(message: Message, state: FSMContext, command: Co
     await message.answer(
         f"برای پیگیری ملک با کد {property_id}، درخواست خود را برای دفتر بنویسید.",
         reply_markup=keyboard((MENU,)),
+    )
+
+
+@dp.message(CommandStart(deep_link=True, magic=F.args == "ask_website"))
+async def start_website_question(message: Message, state: FSMContext):
+    await state.clear()
+    await state.set_state(WebsiteQuestion.text)
+    await message.answer(
+        "سؤال ملکی‌ات را در یک پیام بنویس تا برای دفتر شهر املاک پناهی بفرستم.",
+        reply_markup=keyboard((MENU,)),
+    )
+
+
+@dp.message(WebsiteQuestion.text, F.text, ~F.text.startswith("/"), F.text != MENU)
+async def save_website_question(message: Message, state: FSMContext):
+    question = message.text.strip()
+    if not 0 < len(question) <= 1800:
+        await message.answer("سؤال را در یک پیام حداکثر ۱۸۰۰ نویسه بفرست.")
+        return
+    request_text = "سؤال از سایت SLD\n" + question
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "INSERT INTO leads (user_id, username, request_text, created_at) VALUES (?, ?, ?, ?)",
+            (message.from_user.id, message.from_user.username, request_text,
+             datetime.now(TZ).isoformat(timespec="minutes")),
+        )
+        lead_id = cursor.lastrowid
+        await db.commit()
+    await state.clear()
+    await notify_owner(message.bot, f"💬 پیام سایت #{lead_id}\n{request_text}",
+                       reply_button("buyer", lead_id))
+    await message.answer(
+        f"سؤال شماره {lead_id} ثبت شد. پاسخ دفتر در همین گفتگو به تو می‌رسد.",
+        reply_markup=main_menu(message.from_user.id),
     )
 
 
@@ -1898,6 +1936,9 @@ def web_application(bot, secret):
             raise web.HTTPUnauthorized()
         return await handler(request)
 
+    async def telegram_contact(request):
+        return web.json_response({"username": (await bot.me()).username})
+
     async def catalog(request):
         rows = await inventory({})
         result = []
@@ -2127,6 +2168,7 @@ def web_application(bot, secret):
     app = web.Application(middlewares=[authenticate], client_max_size=2_010_000)
     app.router.add_get("/assistant", assistant_status)
     app.router.add_post("/assistant", assistant)
+    app.router.add_get("/telegram-contact", telegram_contact)
     app.router.add_get("/catalog", catalog)
     app.router.add_get(r"/photos/{id:[0-9]{1,15}}", photo)
     app.router.add_post("/requests", submit)
